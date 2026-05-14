@@ -1,0 +1,5 @@
+fastapi==0.115.13
+uvicorn[standard]==0.34.3
+pydantic==2.11.5
+httpx==0.28.1
+chromadb-client==0.6.3

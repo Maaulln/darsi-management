@@ -1,0 +1,4 @@
+usage_at,period_month,item_code,item_name,item_type,quantity,uom,unit_code,unit_cost_idr,total_cost_idr,source_record_id
+2026-05-14T06:00:00Z,2026-05-01,OBT-001,Ceftriaxone 1g,obat,25,vial,ICU,18000,450000,SIMRS-OA-001
+2026-05-14T06:00:00Z,2026-05-01,ALK-010,Infusion Set,alkes,80,pcs,RI,8500,680000,SIMRS-OA-002
+2026-05-14T06:00:00Z,2026-05-01,OBT-021,Paracetamol 500mg,obat,120,tablet,RJ,1200,144000,SIMRS-OA-003

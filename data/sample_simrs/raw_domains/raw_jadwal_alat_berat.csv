@@ -1,0 +1,4 @@
+device_id,device_name,schedule_start,schedule_end,schedule_type,status,unit_code,operator_id,source_record_id
+MRI-01,MRI Siemens,2026-05-14T07:00:00Z,2026-05-14T09:00:00Z,pemeriksaan,scheduled,RAD,OP-001,SIMRS-AL-001
+CT-02,CT Scan GE,2026-05-14T09:30:00Z,2026-05-14T11:30:00Z,pemeriksaan,scheduled,RAD,OP-002,SIMRS-AL-002
+MRI-01,MRI Siemens,2026-05-14T13:00:00Z,2026-05-14T14:00:00Z,maintenance,scheduled,RAD,OP-003,SIMRS-AL-003

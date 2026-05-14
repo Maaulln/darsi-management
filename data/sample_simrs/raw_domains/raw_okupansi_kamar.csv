@@ -1,0 +1,4 @@
+observed_at,room_id,bed_capacity,bed_occupied,room_status,building_code,floor_code,unit_code,room_class,source_record_id
+2026-05-14T06:00:00Z,VIP-101,2,2,occupied,GED-A,L1,RI,VIP,SIMRS-OK-001
+2026-05-14T06:00:00Z,KLS3-203,4,2,occupied,GED-B,L2,RI,III,SIMRS-OK-002
+2026-05-14T06:00:00Z,ICU-01,1,1,occupied,GED-A,L1,ICU,ICU,SIMRS-OK-003

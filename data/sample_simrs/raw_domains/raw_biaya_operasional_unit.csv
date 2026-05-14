@@ -1,0 +1,4 @@
+period_month,unit_code,cost_category,amount_idr,budget_idr,note,source_record_id
+2026-05-01,ICU,listrik,42500000,40000000,Kenaikan beban pendingin,SIMRS-BI-001
+2026-05-01,RI,air,18200000,20000000,Konsumsi normal,SIMRS-BI-002
+2026-05-01,FARMASI,consumables,56000000,45000000,Penggunaan alkes meningkat,SIMRS-BI-003
