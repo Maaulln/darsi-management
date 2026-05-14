@@ -1,90 +1,77 @@
 # Panduan Menjalankan DARSI Management
 
-Dokumen ini berisi panduan langkah demi langkah untuk menjalankan proyek DARSI Management dari awal.
+Panduan ini menyusun perintah dari nol sampai dashboard aktif sesuai dengan flow di [flow.md](flow.md).
 
-## 1. Prasyarat (Prerequisites)
-Pastikan perangkat Anda sudah terinstall:
-- **Docker Desktop**: [Download di sini](https://www.docker.com/products/docker-desktop/) (Pastikan aplikasi Docker sedang berjalan).
-- **Python 3.11+**: Untuk menjalankan script ingestion data di luar container.
-- **Git**: Untuk melakukan clone repository.
-
----
+## 1. Prasyarat
+- **Docker Desktop** (jalankan dulu)
+- **Python 3.11+** (untuk eksekusi script manual di host, opsional)
 
 ## 2. Persiapan Awal
-Lakukan clone repository dan masuk ke direktori proyek:
 ```bash
-git clone <repository-url>
-cd Darsi
-```
-
-Buat file konfigurasi environment:
-```bash
+git clone <repo-url>
+cd darsi_v3
 cp .env.example .env
 ```
-*(Catatan: Pengaturan default di `.env` sudah dikonfigurasi untuk berjalan di lingkungan Docker local).*
+(`.env` default sudah cocok dengan compose.)
 
----
-
-## 3. Menjalankan Layanan (Docker)
-Gunakan Docker Compose untuk membangun dan menjalankan seluruh kontainer (PostgreSQL, SurrealDB, Ollama, Backend, MCP, Nginx, Metabase):
-
+## 3. Jalankan Layanan
 ```bash
 docker compose up --build -d
-```
-
-Pastikan semua kontainer berjalan dengan status `Running`:
-```bash
 docker compose ps
 ```
+Schema Postgres otomatis ter-load (init-scripts → `data/sql/raw_operational_schema.sql`).
 
----
-
-## 4. Inisialisasi Data (WP1)
-Setelah kontainer berjalan, kita perlu memuat skema database dan data operasional awal.
-
-### A. Memuat Skema Database
-```bash
-docker exec -i darsi-postgres psql -U darsi_user -d darsi < data/sql/raw_operational_schema.sql
-```
-
-### C. Pembersihan Data Internal (Refinement)
-Sebelum dikirim ke SurrealDB, data di PostgreSQL harus dibersihkan secara internal:
-```bash
-python data/ingestion/refine_postgres_internal.py
-```
-*Hasil: Data akan berpindah dari tabel `raw_*` ke `refined_*`.*
-
-### D. Sinkronisasi ke Knowledge Base (SurrealDB)
-Setelah data bersih di PostgreSQL, kirimkan ke SurrealDB:
-```bash
-export SURREALDB_URL=http://localhost:8001
-python data/ingestion/refine_raw_to_surrealdb.py --apply
-```
-*Hasil: Data siap dikonsumsi oleh AI di SurrealDB.*
-
----
-
-## 5. Menyiapkan Model AI (Ollama)
-Pastikan model `qwen3.5:2b` sudah terunduh di dalam kontainer Ollama:
+## 4. Siapkan Model Ollama
 ```bash
 docker exec -it darsi-ollama ollama pull qwen3.5:2b
 ```
 
----
+## 5. Pipeline Data (Fase 1)
+Dua opsi:
 
-## 6. Mengakses Aplikasi
-Sistem sekarang dapat diakses melalui Gateway Nginx:
+### Opsi A — Lewat Airflow (rekomendasi)
+1. Buka http://localhost:8888 (login `admin/admin`).
+2. Trigger DAG **`darsi_data_pipeline`**. Tasks:
+   - `raw_ingestion` → generate 150 record/domain ke `raw_*`
+   - `internal_refinement` → `raw_*` → `refined_*` (filter, trim, IQR cap)
+   - `sync_to_surrealdb` → `refined_*` → `clean_*`
+   - `embed_to_chromadb` → `refined_*` → ChromaDB collections
 
-| Layanan | Alamat (URL) | Keterangan |
+### Opsi B — Manual dari host
+```bash
+pip install -r data/requirements.txt
+export POSTGRES_HOST=localhost
+export SURREALDB_URL=http://localhost:8001
+export CHROMA_HOST=localhost
+export CHROMA_PORT=8002
+
+python data/ingestion/generate_bulk_dummy_data.py
+python data/ingestion/refine_postgres_internal.py
+python data/ingestion/refine_raw_to_surrealdb.py --apply
+python data/ingestion/embed_to_chromadb.py
+```
+
+## 6. Verifikasi
+```bash
+curl http://localhost:8080/api/health
+curl http://localhost:8080/api/readiness
+curl -X POST http://localhost:8080/mcp/context \
+  -H "Content-Type: application/json" \
+  -d '{"query":"okupansi ICU"}'
+```
+
+## 7. Akses Aplikasi
+
+| Layanan | URL | Keterangan |
 | :--- | :--- | :--- |
-| **Frontend UI** | [http://localhost:8080](http://localhost:8080) | Antarmuka Chat AI DARSI |
-| **API Health** | [http://localhost:8080/api/health](http://localhost:8080/api/health) | Cek status backend |
-| **Data List** | [http://localhost:8080/api/data/list](http://localhost:8080/api/data/list) | List data operasional |
-| **Metabase** | [http://localhost:3001](http://localhost:3001) | Dashboard BI (Perlu setup awal) |
+| Dashboard SPA | http://localhost:8080 | Tabs Dashboard/Analytics/Chat/Data/Metabase |
+| API docs | http://localhost:8000/docs | Swagger FastAPI |
+| MCP server | http://localhost:8100/health | Konektor RAG |
+| Airflow | http://localhost:8888 | admin/admin |
+| Metabase | http://localhost:3001 | Setup awal Metabase |
 
----
-
-## 7. Troubleshooting
-- **Docker Error**: Pastikan Docker Desktop sudah aktif. Jika error "port already in use", cek apakah ada layanan lain yang menggunakan port 8080, 5432, atau 8000.
-- **AI Timeout**: Jika pertama kali mengirim pesan AI terasa lambat, ini karena Ollama sedang memuat model ke memori. Tunggu beberapa saat dan coba kirim kembali.
-- **Database Connection**: Jika script ingestion gagal, pastikan `.env` memiliki `POSTGRES_HOST=localhost` saat dijalankan dari host machine.
+## 8. Troubleshooting
+- **Schema tidak terload**: pastikan volume `postgres_data` fresh (`docker compose down -v` lalu `up`).
+- **Ollama timeout pertama kali**: model baru di-load ke memori, sabar 30–60 detik.
+- **ChromaDB query gagal**: pastikan tahap `embed_to_chromadb` sudah berhasil.
+- **MCP context kosong**: cek SurrealDB sudah terisi `clean_*` (lihat task `sync_to_surrealdb`).

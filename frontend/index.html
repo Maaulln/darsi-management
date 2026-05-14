@@ -1,243 +1,174 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="id">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DARSI AI Test Interface</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --primary: #6366f1;
-            --primary-hover: #4f46e5;
-            --bg: #0f172a;
-            --card-bg: #1e293b;
-            --text: #f8fafc;
-            --text-dim: #94a3b8;
-            --accent: #22d3ee;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: 'Outfit', sans-serif;
-            background-color: var(--bg);
-            color: var(--text);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            padding: 20px;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 800px;
-            background: var(--card-bg);
-            border-radius: 24px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            overflow: hidden;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            display: flex;
-            flex-direction: column;
-            height: 80vh;
-        }
-
-        .header {
-            padding: 24px;
-            background: rgba(255, 255, 255, 0.03);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .header h1 {
-            font-size: 1.5rem;
-            font-weight: 600;
-            background: linear-gradient(to right, var(--primary), var(--accent));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .status-badge {
-            font-size: 0.75rem;
-            padding: 4px 12px;
-            border-radius: 99px;
-            background: rgba(34, 211, 238, 0.1);
-            color: var(--accent);
-            border: 1px solid rgba(34, 211, 238, 0.2);
-        }
-
-        #chat-window {
-            flex: 1;
-            padding: 24px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-            scroll-behavior: smooth;
-        }
-
-        .message {
-            max-width: 80%;
-            padding: 12px 20px;
-            border-radius: 18px;
-            line-height: 1.5;
-            font-size: 1rem;
-            animation: fadeIn 0.3s ease-out;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .user-message {
-            align-self: flex-end;
-            background: var(--primary);
-            color: white;
-            border-bottom-right-radius: 4px;
-        }
-
-        .ai-message {
-            align-self: flex-start;
-            background: rgba(255, 255, 255, 0.05);
-            color: var(--text);
-            border-bottom-left-radius: 4px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .input-area {
-            padding: 24px;
-            background: rgba(0, 0, 0, 0.2);
-            display: flex;
-            gap: 12px;
-        }
-
-        input {
-            flex: 1;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 12px 16px;
-            color: white;
-            font-family: inherit;
-            font-size: 1rem;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-
-        input:focus {
-            border-color: var(--primary);
-        }
-
-        button {
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            padding: 0 24px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        button:hover {
-            background: var(--primary-hover);
-            transform: translateY(-1px);
-        }
-
-        button:active {
-            transform: translateY(0);
-        }
-
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .typing {
-            font-size: 0.875rem;
-            color: var(--text-dim);
-            margin-bottom: 8px;
-            display: none;
-        }
-    </style>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DARSI Management — Dashboard Operasional</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>DARSI AI</h1>
-            <div class="status-badge">Ollama Qwen3.5:2b Ready</div>
-        </div>
-        <div id="chat-window">
-            <div class="message ai-message">
-                Halo! Saya asisten AI DARSI. Ada yang bisa saya bantu terkait operasional hari ini?
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="logo">D</div>
+            <div>
+                <h2>DARSI</h2>
+                <span>Management Suite</span>
             </div>
         </div>
-        <div class="input-area">
-            <div id="typing-indicator" class="typing">AI sedang mengetik...</div>
-            <input type="text" id="user-input" placeholder="Tanyakan sesuatu..." autocomplete="off">
-            <button id="send-btn">Kirim</button>
-        </div>
-    </div>
+        <nav>
+            <button class="nav-item active" data-tab="dashboard">📊 Dashboard</button>
+            <button class="nav-item" data-tab="analytics">📈 Analytics</button>
+            <button class="nav-item" data-tab="chat">💬 Chat AI</button>
+            <button class="nav-item" data-tab="data">🗂️ Data Explorer</button>
+            <button class="nav-item" data-tab="metabase">📉 Metabase BI</button>
+        </nav>
+        <footer class="sidebar-foot">
+            <div id="status-pill" class="status-pill">Memeriksa status…</div>
+            <small>RSI Surabaya · Prototype</small>
+        </footer>
+    </aside>
 
-    <script>
-        const chatWindow = document.getElementById('chat-window');
-        const userInput = document.getElementById('user-input');
-        const sendBtn = document.getElementById('send-btn');
-        const typingIndicator = document.getElementById('typing-indicator');
+    <main class="content">
+        <section id="tab-dashboard" class="tab active">
+            <header class="page-head">
+                <div>
+                    <h1>Dashboard Operasional</h1>
+                    <p>Ringkasan indikator utama dari Knowledge Base (SurrealDB).</p>
+                </div>
+                <button id="refresh-overview" class="ghost">🔄 Muat ulang</button>
+            </header>
 
-        function addMessage(text, isUser) {
-            const msgDiv = document.createElement('div');
-            msgDiv.className = `message ${isUser ? 'user-message' : 'ai-message'}`;
-            msgDiv.textContent = text;
-            chatWindow.appendChild(msgDiv);
-            chatWindow.scrollTop = chatWindow.scrollHeight;
-        }
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <span class="kpi-label">Pasien Aktif</span>
+                    <span class="kpi-value" id="kpi-pasien">–</span>
+                </div>
+                <div class="kpi-card">
+                    <span class="kpi-label">BOR</span>
+                    <span class="kpi-value" id="kpi-bor">–</span>
+                    <small id="kpi-bed-detail">– / – bed</small>
+                </div>
+                <div class="kpi-card">
+                    <span class="kpi-label">Konsumsi Listrik</span>
+                    <span class="kpi-value" id="kpi-kwh">–</span>
+                    <small>kWh total</small>
+                </div>
+                <div class="kpi-card">
+                    <span class="kpi-label">Konsumsi Air</span>
+                    <span class="kpi-value" id="kpi-air">–</span>
+                    <small>m³ total</small>
+                </div>
+                <div class="kpi-card">
+                    <span class="kpi-label">Total Biaya</span>
+                    <span class="kpi-value" id="kpi-cost">–</span>
+                    <small id="kpi-budget">Budget –</small>
+                </div>
+                <div class="kpi-card">
+                    <span class="kpi-label">Overtime</span>
+                    <span class="kpi-value" id="kpi-overtime-hour">–</span>
+                    <small id="kpi-overtime-cost">Rp –</small>
+                </div>
+            </div>
 
-        async function sendMessage() {
-            const text = userInput.value.trim();
-            if (!text) return;
+            <div class="chart-grid">
+                <article class="card">
+                    <header><h3>Okupansi per Unit</h3></header>
+                    <canvas id="chart-occupancy"></canvas>
+                </article>
+                <article class="card">
+                    <header><h3>Distribusi Biaya per Kategori</h3></header>
+                    <canvas id="chart-cost"></canvas>
+                </article>
+            </div>
+        </section>
 
-            addMessage(text, true);
-            userInput.value = '';
-            userInput.disabled = true;
-            sendBtn.disabled = true;
-            typingIndicator.style.display = 'block';
+        <section id="tab-analytics" class="tab">
+            <header class="page-head">
+                <h1>Analytics Lanjutan</h1>
+                <p>Tren konsumsi utilitas per unit & ringkasan budget.</p>
+            </header>
+            <div class="chart-grid">
+                <article class="card">
+                    <header><h3>Konsumsi Listrik per Unit</h3></header>
+                    <canvas id="chart-listrik"></canvas>
+                </article>
+                <article class="card">
+                    <header><h3>Konsumsi Air per Unit</h3></header>
+                    <canvas id="chart-air"></canvas>
+                </article>
+            </div>
+            <article class="card">
+                <header><h3>Budget vs Actual per Kategori</h3></header>
+                <canvas id="chart-budget"></canvas>
+            </article>
+        </section>
 
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text })
-                });
+        <section id="tab-chat" class="tab">
+            <header class="page-head">
+                <h1>Chat AI (RAG)</h1>
+                <p>Tanyakan apa pun tentang operasional. Jawaban akan menggunakan data clean SurrealDB & ChromaDB sebagai konteks.</p>
+            </header>
+            <div class="chat-shell">
+                <div id="chat-window" class="chat-window">
+                    <div class="message ai-message">
+                        Halo! Saya asisten DARSI. Coba tanyakan misalnya:
+                        <ul>
+                            <li>Bagaimana okupansi ICU saat ini?</li>
+                            <li>Kategori biaya apa yang paling besar bulan ini?</li>
+                            <li>Berapa total konsumsi listrik per unit?</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="chat-context" id="chat-context">
+                    <strong>Konteks digunakan</strong>
+                    <pre id="context-pre">(belum ada)</pre>
+                </div>
+                <div class="chat-input">
+                    <label class="toggle">
+                        <input type="checkbox" id="rag-toggle" checked />
+                        <span>RAG aktif</span>
+                    </label>
+                    <input type="text" id="user-input" placeholder="Tanyakan sesuatu..." autocomplete="off" />
+                    <button id="send-btn">Kirim</button>
+                </div>
+            </div>
+        </section>
 
-                if (!response.ok) throw new Error('Gagal menghubungi AI');
+        <section id="tab-data" class="tab">
+            <header class="page-head">
+                <h1>Data Explorer</h1>
+                <p>Lihat sample data clean dari SurrealDB per domain.</p>
+            </header>
+            <div class="data-shell">
+                <aside>
+                    <h3>Domain</h3>
+                    <ul id="domain-list" class="domain-list"></ul>
+                </aside>
+                <div class="card">
+                    <header>
+                        <h3 id="data-title">Pilih domain di sebelah kiri</h3>
+                        <small id="data-meta"></small>
+                    </header>
+                    <div class="table-wrap">
+                        <table id="data-table"></table>
+                    </div>
+                </div>
+            </div>
+        </section>
 
-                const data = await response.json();
-                addMessage(data.response, false);
-            } catch (error) {
-                addMessage('Error: ' + error.message, false);
-            } finally {
-                userInput.disabled = false;
-                sendBtn.disabled = false;
-                typingIndicator.style.display = 'none';
-                userInput.focus();
-            }
-        }
+        <section id="tab-metabase" class="tab">
+            <header class="page-head">
+                <h1>Metabase BI</h1>
+                <p>Embed dashboard Metabase. Pastikan sudah disetup di http://localhost:3001.</p>
+            </header>
+            <div class="iframe-wrap">
+                <iframe id="metabase-frame" src="/metabase/" title="Metabase Dashboard"></iframe>
+            </div>
+        </section>
+    </main>
 
-        sendBtn.addEventListener('click', sendMessage);
-        userInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendMessage();
-        });
-    </script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="/app.js"></script>
 </body>
 </html>

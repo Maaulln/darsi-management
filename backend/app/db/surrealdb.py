@@ -41,6 +41,8 @@ class SurrealDBClient:
             "Accept": "application/json",
             "surreal-ns": namespace,
             "surreal-db": database,
+            "NS": namespace,
+            "DB": database,
         }
 
     def query(self, sql: str) -> list[dict[str, Any]]:

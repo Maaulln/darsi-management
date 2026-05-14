@@ -10,6 +10,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./data/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-darsi_user}"]
       interval: 10s
@@ -28,6 +29,8 @@ services:
     container_name: darsi-chromadb
     ports:
       - "8002:8000"
+    volumes:
+      - chromadb_data:/chroma/data
 
   ollama:
     image: ollama/ollama:latest
@@ -35,8 +38,9 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      # Mount host Ollama data so container reuses local models and avoids re-download
-      - /Users/maaullntech/.ollama:/root/.ollama:rw
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
 
   backend:
     build:
@@ -46,12 +50,21 @@ services:
     env_file:
       - .env
     environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      SURREALDB_URL: http://surrealdb:8000
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
+      OLLAMA_BASE_URL: http://ollama:11434
+      MCP_SERVER_URL: http://mcp-server:8100
     depends_on:
       postgres:
         condition: service_healthy
       chromadb:
+        condition: service_started
+      surrealdb:
+        condition: service_started
+      ollama:
         condition: service_started
     ports:
       - "8000:8000"
@@ -80,6 +93,13 @@ services:
     container_name: darsi-metabase
     ports:
       - "3001:3000"
+    volumes:
+      - metabase_data:/metabase-data
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   nginx:
     image: nginx:1.27-alpine
@@ -92,6 +112,7 @@ services:
     depends_on:
       - backend
       - mcp-server
+      - metabase
 
   airflow:
     image: apache/airflow:2.9.2-python3.11
@@ -116,13 +137,15 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - ./data/ingestion:/opt/airflow/scripts
+      - ./data/sample_simrs:/opt/airflow/data/sample_simrs
       - airflow_logs:/opt/airflow/logs
     ports:
       - "8888:8080"
     command: >
       bash -c "
+        pip install --no-cache-dir pandas==2.2.3 numpy==2.0.2 sqlalchemy==2.0.41 psycopg2-binary==2.9.10 requests==2.32.3 chromadb-client==0.6.3 &&
         airflow db migrate &&
-        airflow users create --username admin --firstname Admin --lastname DARSI --role Admin --email admin@darsi.id --password admin &&
+        (airflow users create --username admin --firstname Admin --lastname DARSI --role Admin --email admin@darsi.id --password admin || true) &&
         airflow webserver &
         airflow scheduler
       "
@@ -133,4 +156,6 @@ services:
 volumes:
   postgres_data:
   airflow_logs:
-  # ollama_data is intentionally not used; models are bind-mounted from host
+  ollama_data:
+  chromadb_data:
+  metabase_data:

@@ -11,11 +11,11 @@ class Settings(BaseSettings):
         app_env: Lingkungan aplikasi, contoh: development atau production.
         app_host: Host bind untuk server FastAPI.
         app_port: Port bind untuk server FastAPI.
-        postgres_host: Host layanan PostgreSQL.
-        postgres_port: Port layanan PostgreSQL.
-        postgres_db: Nama database PostgreSQL.
-        postgres_user: Username PostgreSQL.
-        postgres_password: Password PostgreSQL.
+        postgres_*: Konfigurasi PostgreSQL.
+        surrealdb_*: Konfigurasi SurrealDB.
+        chroma_*: Konfigurasi ChromaDB.
+        ollama_*: Konfigurasi Ollama LLM.
+        mcp_server_url: URL MCP server untuk pengambilan konteks RAG.
     """
 
     app_name: str = "DARSI Management API"
@@ -40,6 +40,8 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = "http://ollama:11434"
     ollama_model: str = "qwen3.5:2b"
+
+    mcp_server_url: str = "http://mcp-server:8100"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
