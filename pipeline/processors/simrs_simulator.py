@@ -180,6 +180,114 @@ def _gen_jadwal_alat_berat(n: int, now: datetime) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _gen_kunjungan_layanan(n: int, now: datetime) -> pd.DataFrame:
+    rows = []
+    layanan_types = ["rawat_inap", "rawat_jalan", "igd", "operasi", "penunjang"]
+    payer_types = ["bpjs", "umum", "asuransi", "gratis"]
+    for _ in range(n):
+        kunjungan = random.randint(1, 80)
+        rows.append({
+            "source_record_id": f"KNJ-{random.randint(10000, 99999)}",
+            "period_date": (now - timedelta(days=random.randint(0, 30))).date(),
+            "unit_code": random.choice(UNITS),
+            "layanan_type": random.choice(layanan_types),
+            "payer_type": random.choice(payer_types),
+            "jumlah_kunjungan": kunjungan,
+            "jumlah_tindakan": random.randint(kunjungan, kunjungan * 3),
+            "jumlah_pasien_baru": random.randint(0, kunjungan),
+            "jumlah_pasien_keluar": random.randint(0, kunjungan),
+            "rata_lama_rawat_hari": round(random.uniform(1.0, 14.0), 1),
+            "created_at": now,
+        })
+    return pd.DataFrame(rows)
+
+
+def _gen_pendapatan_unit(n: int, now: datetime) -> pd.DataFrame:
+    rows = []
+    revenue_categories = ["jasa_layanan", "obat", "alkes", "laboratorium", "radiologi", "kamar", "lain"]
+    payer_types = ["bpjs", "umum", "asuransi", "gratis"]
+    for _ in range(n):
+        amount = round(random.uniform(500_000, 200_000_000), 0)
+        rows.append({
+            "source_record_id": f"REV-{random.randint(10000, 99999)}",
+            "period_month": datetime(now.year, now.month, 1),
+            "unit_code": random.choice(UNITS),
+            "revenue_category": random.choice(revenue_categories),
+            "payer_type": random.choice(payer_types),
+            "amount_idr": amount,
+            "target_idr": round(amount * random.uniform(0.8, 1.3), 0),
+            "created_at": now,
+        })
+    return pd.DataFrame(rows)
+
+
+def _gen_jadwal_staf(n: int, now: datetime) -> pd.DataFrame:
+    rows = []
+    shift_types = ["pagi", "siang", "malam", "on_call"]
+    shift_hours = {
+        "pagi":    ("07:00", "14:00", 7),
+        "siang":   ("14:00", "21:00", 7),
+        "malam":   ("21:00", "07:00", 10),
+        "on_call": ("08:00", "20:00", 12),
+    }
+    roles = ["Perawat", "Dokter", "Admin", "Teknisi", "Bidan"]
+    for _ in range(n):
+        shift = random.choice(shift_types)
+        s_start, s_end, s_hours = shift_hours[shift]
+        delta_actual = round(random.uniform(-0.5, 1.0), 1)
+        absent = random.random() < 0.05
+        rows.append({
+            "source_record_id": f"SHFT-{random.randint(10000, 99999)}",
+            "shift_date": (now - timedelta(days=random.randint(0, 7))).date(),
+            "unit_code": random.choice(UNITS),
+            "staff_id": f"ST-{random.randint(100, 999)}",
+            "role_name": random.choice(roles),
+            "shift_type": shift,
+            "scheduled_start": s_start,
+            "scheduled_end": s_end,
+            "actual_start": s_start if not absent else None,
+            "actual_end": s_end if not absent else None,
+            "scheduled_hours": s_hours,
+            "actual_hours": round(s_hours + delta_actual, 1) if not absent else 0,
+            "absent": absent,
+            "absent_reason": random.choice(["Sakit", "Izin", "Cuti"]) if absent else None,
+            "created_at": now,
+        })
+    return pd.DataFrame(rows)
+
+
+def _gen_downtime_alat(n: int, now: datetime) -> pd.DataFrame:
+    rows = []
+    downtime_types = ["planned", "unplanned", "preventive"]
+    severities = ["low", "medium", "high", "critical"]
+    devices = [
+        ("DIAG-10", "MRI"), ("DIAG-20", "CT Scan"), ("DIAG-30", "X-Ray"),
+        ("DIAG-40", "Ventilator"), ("DIAG-50", "USG"), ("DIAG-60", "Autoclave"),
+    ]
+    for _ in range(n):
+        device_id, device_name = random.choice(devices)
+        dt_type = random.choice(downtime_types)
+        start = now - timedelta(hours=random.randint(1, 72))
+        resolved = random.random() < 0.7
+        end = start + timedelta(hours=random.randint(1, 8)) if resolved else None
+        rows.append({
+            "source_record_id": f"DT-{random.randint(10000, 99999)}",
+            "device_id": device_id,
+            "device_name": device_name,
+            "unit_code": random.choice(["RAD", "ICU", "OK", "UGD"]),
+            "downtime_start": start,
+            "downtime_end": end,
+            "downtime_type": dt_type,
+            "downtime_cause": random.choice(["Kerusakan komponen", "Kalibrasi", "Pemeliharaan rutin", "Gangguan daya"]),
+            "severity": random.choice(severities),
+            "repair_vendor": random.choice(["Siemens", "GE Healthcare", "Philips", "Internal"]),
+            "repair_cost_idr": round(random.uniform(500_000, 50_000_000), 0) if resolved else None,
+            "resolved": resolved,
+            "created_at": now,
+        })
+    return pd.DataFrame(rows)
+
+
 # ─── Domain registry ──────────────────────────────────────────────────────────
 
 DOMAINS = [
@@ -191,6 +299,10 @@ DOMAINS = [
     ("raw_konsumsi_obat_alkes",     _gen_konsumsi_obat_alkes),
     ("raw_lembur_staf",             _gen_lembur_staf),
     ("raw_jadwal_alat_berat",       _gen_jadwal_alat_berat),
+    ("raw_kunjungan_layanan",       _gen_kunjungan_layanan),
+    ("raw_pendapatan_unit",         _gen_pendapatan_unit),
+    ("raw_jadwal_staf",             _gen_jadwal_staf),
+    ("raw_downtime_alat",           _gen_downtime_alat),
 ]
 
 # ─── Runner ───────────────────────────────────────────────────────────────────
