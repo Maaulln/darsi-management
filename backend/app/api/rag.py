@@ -20,7 +20,7 @@ class RagResponse(BaseModel):
     context_used: str
     answer: str
     source: str
-    chroma_hits: int = 0
+    vector_hits: int = 0
     surreal_hits: int = 0
     matched_domains: list[str] = []
 

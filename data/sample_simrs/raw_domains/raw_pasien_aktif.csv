@@ -1,4 +1,0 @@
-snapshot_at,patient_id,status_aktif,admission_id,unit_code,room_code,class_code,payer_type,diagnosis_code,source_record_id
-2026-05-14T06:00:00Z,PAS-001,aktif,ADM-001,ICU,R-ICU-01,VIP,BPJS,E11.9,SIMRS-PA-001
-2026-05-14T06:00:00Z,PAS-002,aktif,ADM-002,RI,KLS3-02,III,UMUM,I10,SIMRS-PA-002
-2026-05-14T06:00:00Z,PAS-003,aktif,ADM-003,IGD,IGD-05,IGD,BPJS,J18.9,SIMRS-PA-003

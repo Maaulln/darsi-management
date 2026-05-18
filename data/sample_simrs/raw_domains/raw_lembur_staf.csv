@@ -1,4 +1,0 @@
-overtime_date,unit_code,staff_id,role_name,overtime_hours,overtime_cost_idr,reason,source_record_id
-2026-05-13,ICU,STF-001,Perawat,3.5,315000,Cover shift malam,SIMRS-LM-001
-2026-05-13,RI,STF-014,Perawat,2.0,170000,Penambahan pasien,SIMRS-LM-002
-2026-05-13,LAB,STF-021,Analis Lab,4.0,420000,Backlog sampel,SIMRS-LM-003

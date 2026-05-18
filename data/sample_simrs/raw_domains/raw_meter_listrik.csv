@@ -1,4 +1,0 @@
-meter_id,building_code,floor_code,unit_code,reading_at,kwh_total,voltage_avg,current_avg,power_factor
-MTR-L-001,GED-A,L1,ICU,2026-05-14T06:00:00Z,12450.400,220.5,35.2,0.93
-MTR-L-002,GED-B,L2,RI,2026-05-14T06:00:00Z,9850.100,219.8,28.7,0.91
-MTR-L-003,GED-C,L3,RJ,2026-05-14T06:00:00Z,7650.000,221.1,19.4,0.95

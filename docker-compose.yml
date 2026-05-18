@@ -10,7 +10,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./data/sql:/docker-entrypoint-initdb.d:ro
+      - ./pipeline/data/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-darsi_user}"]
       interval: 10s
@@ -20,17 +20,17 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:latest
     container_name: darsi-surrealdb
-    command: start --log info --user ${SURREALDB_USER:-root} --pass ${SURREALDB_PASSWORD:-root} memory
+    user: root
+    command: start --log info --username ${SURREALDB_USER:-root} --password ${SURREALDB_PASSWORD:-root} surrealkv:///data/darsi
     ports:
       - "8001:8000"
-
-  chromadb:
-    image: chromadb/chroma:1.0.12
-    container_name: darsi-chromadb
-    ports:
-      - "8002:8000"
     volumes:
-      - chromadb_data:/chroma/data
+      - surrealdb_data:/data
+    healthcheck:
+      test: ["CMD", "/surreal", "isready", "--endpoint", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   ollama:
     image: ollama/ollama:latest
@@ -53,15 +53,11 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       SURREALDB_URL: http://surrealdb:8000
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: "8000"
       OLLAMA_BASE_URL: http://ollama:11434
       MCP_SERVER_URL: http://mcp-server:8100
     depends_on:
       postgres:
         condition: service_healthy
-      chromadb:
-        condition: service_started
       surrealdb:
         condition: service_started
       ollama:
@@ -75,18 +71,93 @@ services:
       dockerfile: Dockerfile
     container_name: darsi-mcp-server
     environment:
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: "8000"
       SURREALDB_URL: http://surrealdb:8000
       SURREALDB_USER: ${SURREALDB_USER:-root}
       SURREALDB_PASSWORD: ${SURREALDB_PASSWORD:-root}
       SURREALDB_NS: ${SURREALDB_NS:-darsi}
       SURREALDB_DB: ${SURREALDB_DB:-operasional}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:2b}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
     depends_on:
-      - chromadb
-      - surrealdb
+      surrealdb:
+        condition: service_started
+      ollama:
+        condition: service_started
     ports:
       - "8100:8100"
+
+  simrs-simulator:
+    image: python:3.11-slim
+    container_name: darsi-simrs-simulator
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-darsi}
+      POSTGRES_USER: ${POSTGRES_USER:-darsi_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-darsi_password}
+      SIMULATOR_INTERVAL: "10"
+      SIMULATOR_MIN_RECORDS: "1"
+      SIMULATOR_MAX_RECORDS: "100"
+    volumes:
+      - ./pipeline/processors:/app
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir pandas==2.2.3 sqlalchemy==2.0.41 psycopg2-binary==2.9.10 &&
+        python simrs_simulator.py
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pipeline-service:
+    build:
+      context: ./pipeline-service
+      dockerfile: Dockerfile
+    container_name: darsi-pipeline-service
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-darsi}
+      POSTGRES_USER: ${POSTGRES_USER:-darsi_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-darsi_password}
+      SURREALDB_URL: http://surrealdb:8000
+      SURREALDB_USER: ${SURREALDB_USER:-root}
+      SURREALDB_PASSWORD: ${SURREALDB_PASSWORD:-root}
+      SURREALDB_NS: ${SURREALDB_NS:-darsi}
+      SURREALDB_DB: ${SURREALDB_DB:-operasional}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:2b}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      PROCESSORS_DIR: /app/processors
+    volumes:
+      - ./pipeline/processors:/app/processors
+    ports:
+      - "8200:8200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: darsi-n8n
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    environment:
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678
+    depends_on:
+      - pipeline-service
+    restart: unless-stopped
 
   metabase:
     image: metabase/metabase:latest
@@ -101,6 +172,15 @@ services:
       postgres:
         condition: service_healthy
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: darsi-frontend
+    depends_on:
+      - backend
+    restart: unless-stopped
+
   nginx:
     image: nginx:1.27-alpine
     container_name: darsi-nginx
@@ -108,54 +188,15 @@ services:
       - "8080:80"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./frontend:/usr/share/nginx/html:ro
     depends_on:
       - backend
       - mcp-server
       - metabase
-
-  airflow:
-    image: apache/airflow:2.9.2-python3.11
-    container_name: darsi-airflow
-    environment:
-      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-darsi}
-      POSTGRES_USER: ${POSTGRES_USER:-darsi_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-darsi_password}
-      SURREALDB_URL: http://surrealdb:8000
-      SURREALDB_USER: ${SURREALDB_USER:-root}
-      SURREALDB_PASSWORD: ${SURREALDB_PASSWORD:-root}
-      SURREALDB_NS: ${SURREALDB_NS:-darsi}
-      SURREALDB_DB: ${SURREALDB_DB:-operasional}
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: "8000"
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./data/ingestion:/opt/airflow/scripts
-      - ./data/sample_simrs:/opt/airflow/data/sample_simrs
-      - airflow_logs:/opt/airflow/logs
-    ports:
-      - "8888:8080"
-    command: >
-      bash -c "
-        pip install --no-cache-dir pandas==2.2.3 numpy==2.0.2 sqlalchemy==2.0.41 psycopg2-binary==2.9.10 requests==2.32.3 chromadb-client==0.6.3 &&
-        airflow db migrate &&
-        (airflow users create --username admin --firstname Admin --lastname DARSI --role Admin --email admin@darsi.id --password admin || true) &&
-        airflow webserver &
-        airflow scheduler
-      "
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - frontend
 
 volumes:
   postgres_data:
-  airflow_logs:
+  surrealdb_data:
   ollama_data:
-  chromadb_data:
   metabase_data:
+  n8n_data:

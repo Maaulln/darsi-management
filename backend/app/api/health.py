@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import httpx
 from fastapi import APIRouter
-from sqlalchemy import text
 
-from app.core.config import settings
-from app.db.postgres import create_postgres_engine
+from app.services.mcp_client import mcp_client
 
 router = APIRouter(tags=["health"])
 
@@ -26,32 +23,20 @@ async def api_health_check() -> dict[str, str]:
 
 @router.get("/api/readiness")
 async def readiness() -> dict[str, object]:
-    """Periksa konektivitas downstream: Postgres, MCP server, dan Ollama."""
-
+    """Periksa konektivitas: MCP server (liveness) + semua downstream via MCP."""
     status: dict[str, object] = {}
 
-    try:
-        engine = create_postgres_engine()
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        status["postgres"] = "ok"
-    except Exception as error:  # noqa: BLE001
-        status["postgres"] = f"down: {error}"
+    mcp_live = mcp_client.health()
+    status["mcp_server"] = "ok" if mcp_live.get("status") == "ok" else f"down: {mcp_live}"
 
-    try:
-        response = httpx.get(f"{settings.mcp_server_url}/health", timeout=5.0)
-        response.raise_for_status()
-        status["mcp_server"] = "ok"
-    except Exception as error:  # noqa: BLE001
-        status["mcp_server"] = f"down: {error}"
+    if status["mcp_server"] == "ok":
+        downstream = mcp_client.health_downstream()
+        status["surrealdb"] = downstream.get("surrealdb", "unknown")
+        status["ollama"] = downstream.get("ollama", "unknown")
+    else:
+        status["surrealdb"] = "unreachable (mcp down)"
+        status["ollama"] = "unreachable (mcp down)"
 
-    try:
-        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=5.0)
-        response.raise_for_status()
-        status["ollama"] = "ok"
-    except Exception as error:  # noqa: BLE001
-        status["ollama"] = f"down: {error}"
-
-    overall = "ok" if all(value == "ok" for value in status.values()) else "degraded"
+    overall = "ok" if all(v == "ok" for v in status.values()) else "degraded"
     status["overall"] = overall
     return status

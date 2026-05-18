@@ -1,0 +1,6 @@
+record_id,unit,indikator,nilai,timestamp
+SIMRS-001,Rawat Inap,Bed Occupancy Rate,72,2026-05-14T08:00:00
+SIMRS-002,IGD,Waktu Tunggu Menit,18,2026-05-14T08:00:00
+SIMRS-003,Radiologi,Utilisasi Alat CT,64,2026-05-14T08:00:00
+SIMRS-004,Laboratorium,Turnaround Time Menit,42,2026-05-14T08:00:00
+SIMRS-005,Rawat Jalan,Jumlah Kunjungan,128,2026-05-14T08:00:00

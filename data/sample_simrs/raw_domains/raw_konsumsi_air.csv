@@ -1,4 +1,0 @@
-meter_id,unit_code,reading_at,volume_m3_total,building_code,pressure_avg
-MTR-A-001,ICU,2026-05-14T06:00:00Z,1520.500,GED-A,2.30
-MTR-A-002,RI,2026-05-14T06:00:00Z,2310.250,GED-B,2.10
-MTR-A-003,RJ,2026-05-14T06:00:00Z,980.900,GED-C,1.95
