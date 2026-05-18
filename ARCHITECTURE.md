@@ -13,6 +13,119 @@ Pattern utama yang digunakan:
 
 ---
 
+## Microservice Architecture
+
+DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai kontainer Docker terisolasi. Setiap service memiliki Dockerfile dan lifecycle tersendiri — dapat di-build, diuji, dan di-restart secara independen tanpa memengaruhi service lain.
+
+### Prinsip Desain
+
+| Prinsip | Implementasi dalam DARSI |
+|---|---|
+| **Single Responsibility** | Tiap service hanya menangani satu domain fungsi |
+| **Loose Coupling** | Komunikasi via HTTP REST atau koneksi DB langsung — tidak ada shared memory |
+| **Independent Deployment** | `docker compose up --build <service>` dapat dijalankan per service |
+| **Private Network** | Semua service berada dalam Docker internal network; hanya Nginx (8080), n8n (5678), dan Metabase (3001) yang diekspos ke host |
+| **Stateless Services** | Backend, MCP Server, dan Pipeline Service tidak menyimpan state — state ada di PostgreSQL dan SurrealDB |
+
+### Service Boundaries
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  PRESENTATION TIER                                                   │
+│  ┌─────────────────────┐    ┌──────────────────────────────────┐    │
+│  │  [frontend]          │    │  [metabase]                      │    │
+│  │  React SPA           │    │  BI Reporting & Embedded Charts  │    │
+│  │  Vite + React 18     │    │  Direct DB query ke PostgreSQL   │    │
+│  └──────────┬───────────┘    └──────────────────────────────────┘    │
+└─────────────┼────────────────────────────────────────────────────────┘
+              │ HTTP
+┌─────────────▼────────────────────────────────────────────────────────┐
+│  GATEWAY TIER                                                        │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  [nginx]  Port 8080                                          │   │
+│  │  Reverse proxy — routes /api/* → backend, / → frontend      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└─────────────┬────────────────────────────────────────────────────────┘
+              │ HTTP /api/*
+┌─────────────▼────────────────────────────────────────────────────────┐
+│  APPLICATION TIER                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  [backend]  Port 8000                                        │   │
+│  │  FastAPI — thin REST layer, semua logika delegasi ke MCP     │   │
+│  │  Endpoints: /api/analytics /api/chat /api/rag /api/summary   │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└─────────────┬────────────────────────────────────────────────────────┘
+              │ HTTP
+┌─────────────▼────────────────────────────────────────────────────────┐
+│  AI TIER                                                             │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  [mcp-server]  Port 8100                                     │   │
+│  │  Data Connector → Context Manager → LLM Generation           │   │
+│  │  Orchestrates: SurrealDB query + vector search + Ollama call │   │
+│  └──────────┬───────────────────────────┬──────────────────────┘   │
+│             │ httpx                      │ LangChain LCEL            │
+│  ┌──────────▼───────────┐   ┌───────────▼──────────────────────┐   │
+│  │  [surrealdb] Port 8001│   │  [ollama]  Port 11434            │   │
+│  │  clean_* structured  │   │  qwen3.5:2b  — text generation   │   │
+│  │  + HNSW vector index │   │  nomic-embed-text — embedding    │   │
+│  └──────────────────────┘   └──────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  DATA & PIPELINE TIER                                                │
+│                                                                      │
+│  ┌─────────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │  [simrs-simulator]│  │  [postgres]  │  │  [n8n]  Port 5678     │  │
+│  │  No exposed port │  │  Port 5432   │  │  Cron orchestrator    │  │
+│  │  Insert raw_*    │─►│  raw_* tables│  │  HTTP trigger 1 menit │  │
+│  │  setiap 10 detik │  │  13 domain   │  └───────────┬────────────┘  │
+│  └─────────────────┘  └──────────────┘              │ HTTP POST     │
+│                                                      ▼               │
+│                              ┌────────────────────────────────────┐  │
+│                              │  [pipeline-service]  Port 8200     │  │
+│                              │  POST /refine → Pandas cleaning    │  │
+│                              │  POST /sync   → write SurrealDB    │  │
+│                              │  POST /embed  → generate + store   │  │
+│                              │               vector (Ollama)       │  │
+│                              └────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Microservice Catalog
+
+| Service | Image / Base | Port | Tier | Tanggung Jawab Tunggal |
+|---|---|---|---|---|
+| `nginx` | nginx:1.27-alpine | 8080 | Gateway | Route traffic; single entry point |
+| `frontend` | node → nginx (multi-stage) | — | Presentation | React SPA: KPI dashboard, chat AI, summary |
+| `metabase` | metabase/metabase | 3001 | Presentation | BI reporting via direct DB query |
+| `backend` | python:3.11 | 8000 | Application | REST API — proxy & translate request ke MCP Server |
+| `mcp-server` | python:3.11 | 8100 | AI | RAG pipeline: data retrieval + context assembly + LLM call |
+| `ollama` | ollama/ollama | 11434 | AI | Local LLM inference (qwen3.5:2b + nomic-embed-text) |
+| `surrealdb` | surrealdb/surrealdb | 8001 | Data | Clean data store (`clean_*`) + HNSW vector index |
+| `pipeline-service` | python:3.11 | 8200 | Pipeline | Pandas ETL: raw → refined → clean + embed |
+| `n8n` | n8nio/n8n | 5678 | Pipeline | Cron orchestrator — HTTP trigger pipeline-service |
+| `postgres` | postgres:16 | 5432 | Data | Raw SIMRS data store (`raw_*`, 13 domain) |
+| `simrs-simulator` | python:3.11 | — | Data | Real-time data generator ke PostgreSQL |
+
+### Inter-Service Communication Matrix
+
+| From | To | Protokol | Frekuensi | Keterangan |
+|---|---|---|---|---|
+| React | Nginx | HTTP REST | Per user action | Semua request via single entry point |
+| Nginx | Backend | HTTP proxy | Per user action | Route `/api/*` |
+| Nginx | Frontend | Static serve | Per page load | SPA files |
+| Backend | MCP Server | HTTP REST | Per user action | Delegasi semua logika AI |
+| MCP Server | SurrealDB | httpx | Per AI request | Structured query + vector search |
+| MCP Server | Ollama | LangChain LCEL | Per AI request | Text generation (qwen3.5:2b) |
+| Pipeline Service | Ollama | HTTP (Ollama API) | Setiap 1 menit | Embedding (nomic-embed-text) |
+| Pipeline Service | SurrealDB | httpx | Setiap 1 menit | Write `clean_*` + vector index |
+| Pipeline Service | PostgreSQL | SQLAlchemy | Setiap 1 menit | Read `raw_*`, write `refined_*` |
+| n8n | Pipeline Service | HTTP POST | Setiap 1 menit (cron) | Trigger `/refine` → `/sync` → `/embed` |
+| SIMRS Simulator | PostgreSQL | SQLAlchemy | Setiap 10 detik | Insert `raw_*` |
+| Metabase | PostgreSQL | JDBC direct | Per dashboard load | Reporting query |
+
+---
+
 ## System Diagram
 
 ```
