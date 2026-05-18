@@ -27,6 +27,114 @@ FastAPI Backend → React + Metabase (Frontend Dashboard)
 
 ---
 
+## Microservice Architecture
+
+DARSI dibangun di atas pola **Layered Microservices** — setiap layanan berjalan sebagai kontainer Docker yang terisolasi, memiliki tanggung jawab tunggal, dan berkomunikasi lewat interface yang terdefinisi (HTTP/REST atau koneksi database langsung).
+
+### Prinsip Utama
+
+| Prinsip | Implementasi |
+|---|---|
+| **Single Responsibility** | Setiap service hanya menangani satu domain fungsi (data ingest, AI, pipeline, UI) |
+| **Loose Coupling** | Antar service berkomunikasi via HTTP REST — tidak ada shared memory atau direct function call |
+| **Independent Deployment** | Setiap service dapat di-build, diuji, dan di-restart secara independen via Docker |
+| **Private Network** | Semua service berada dalam Docker internal network; hanya Nginx, n8n, dan Metabase yang diekspos keluar |
+
+### Microservice Breakdown
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        PRESENTATION TIER                        │
+│                                                                 │
+│  ┌──────────────────┐          ┌────────────────────────────┐   │
+│  │  React Frontend  │          │    Metabase (Port 3001)    │   │
+│  │  (SPA, Port 80)  │          │  Reporting & BI Dashboard  │   │
+│  └────────┬─────────┘          └──────────────┬─────────────┘   │
+└───────────┼────────────────────────────────────┼────────────────┘
+            │ HTTP                               │ Direct DB
+┌───────────▼────────────────────────────────────┼────────────────┐
+│                        GATEWAY TIER             │                │
+│  ┌──────────────────────────────────────────┐   │                │
+│  │           Nginx (Port 8080)              │   │                │
+│  │         Reverse Proxy & Router           │   │                │
+│  └──────────────────┬───────────────────────┘   │                │
+└─────────────────────┼───────────────────────────┼────────────────┘
+                      │ HTTP /api/*               │
+┌─────────────────────▼───────────────────────────┼────────────────┐
+│                    APPLICATION TIER              │                │
+│  ┌──────────────────────────────────────────┐   │                │
+│  │       FastAPI Backend (Port 8000)        │   │                │
+│  │   REST API: analytics, chat, rag,        │   │                │
+│  │            summary, data, health         │   │                │
+│  └──────────────────┬───────────────────────┘   │                │
+└─────────────────────┼───────────────────────────┼────────────────┘
+                      │ HTTP
+┌─────────────────────▼───────────────────────────┼────────────────┐
+│                       AI TIER                    │                │
+│  ┌──────────────────────────────────────────┐    │                │
+│  │         MCP Server (Port 8100)           │    │                │
+│  │  Data Connector · Context Manager ·      │    │                │
+│  │           LLM Generation (RAG)           │    │                │
+│  └──────┬────────────────────────┬──────────┘    │                │
+│         │                        │               │                │
+│  ┌──────▼────────────┐  ┌────────▼─────────┐    │                │
+│  │   SurrealDB       │  │  Ollama           │    │                │
+│  │  (Port 8001)      │  │  (Port 11434)     │    │                │
+│  │ clean_* + HNSW    │  │ qwen3.5:2b        │    │                │
+│  │  vector index     │  │ nomic-embed-text  │◄───┘                │
+│  └───────────────────┘  └──────────────────┘                     │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│                       DATA & PIPELINE TIER                        │
+│                                                                   │
+│  ┌──────────────┐  ┌───────────┐  ┌─────────────────────────┐    │
+│  │  PostgreSQL  │  │    n8n    │  │   Pipeline Service       │    │
+│  │  (Port 5432) │  │(Port 5678)│  │      (Port 8200)         │    │
+│  │  raw_* tables│  │ Cron 1mnt │──► /refine /sync /embed     │    │
+│  │  13 domain   │◄─┤ Orchestrator  └──────────┬──────────────┘    │
+│  └──────▲───────┘  └───────────┘             │                    │
+│         │                                    ▼                    │
+│  ┌──────┴──────────┐                   SurrealDB                  │
+│  │ SIMRS Simulator │                 (clean_* + vector)            │
+│  │ setiap 10 dtk   │                                              │
+│  └─────────────────┘                                              │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### Daftar Microservice
+
+| Service | Port | Tier | Tanggung Jawab |
+|---|---|---|---|
+| `nginx` | 8080 | Gateway | Reverse proxy, routing `/api/*` → backend, SPA serving |
+| `frontend` | — | Presentation | React SPA: dashboard KPI, chat AI, summary, status |
+| `metabase` | 3001 | Presentation | BI reporting: chart fasilitas, tren layanan, konsumsi utilitas |
+| `backend` | 8000 | Application | FastAPI REST API: proxy request ke MCP Server |
+| `mcp-server` | 8100 | AI | Data Connector + Context Manager + LLM Generation (RAG) |
+| `ollama` | 11434 | AI | Local LLM inference: `qwen3.5:2b` (chat) + `nomic-embed-text` (embed) |
+| `surrealdb` | 8001 | Data | Clean structured data (`clean_*`) + vector index HNSW |
+| `pipeline-service` | 8200 | Pipeline | Pandas refinement + sync SurrealDB + generate embedding |
+| `n8n` | 5678 | Pipeline | Cron orchestrator → HTTP trigger ke pipeline-service setiap 1 menit |
+| `postgres` | 5432 | Data | Raw SIMRS data store: `raw_*` tables (13 domain) |
+| `simrs-simulator` | — | Data | Penghasil data real-time: insert 1–100 record/domain setiap 10 detik |
+
+### Inter-Service Communication
+
+```
+[React]          ──── HTTP GET/POST ────► [Nginx] ──► [FastAPI Backend]
+[FastAPI]        ──── HTTP REST ─────────► [MCP Server]
+[MCP Server]     ──── httpx ─────────────► [SurrealDB]  (structured query + vector search)
+[MCP Server]     ──── LangChain LCEL ────► [Ollama]     (qwen3.5:2b generation)
+[Pipeline Svc]   ──── Ollama API ─────────► [Ollama]     (nomic-embed-text embedding)
+[Pipeline Svc]   ──── httpx ─────────────► [SurrealDB]  (write clean_* + vector index)
+[Pipeline Svc]   ──── SQLAlchemy ─────────► [PostgreSQL] (read raw_*, write refined_*)
+[SIMRS Simulator]──── SQLAlchemy ─────────► [PostgreSQL] (insert raw_* setiap 10 detik)
+[n8n]            ──── HTTP POST ──────────► [Pipeline Service] (trigger setiap 1 menit)
+[Metabase]       ──── Direct DB ──────────► [PostgreSQL] / [SurrealDB]
+```
+
+---
+
 ## Tech Stack
 
 | Layer | Technology | Purpose |
