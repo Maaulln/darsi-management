@@ -336,6 +336,36 @@ def wait_for_postgres(engine, retries: int = 15, delay: int = 5) -> None:
     raise RuntimeError("PostgreSQL tidak dapat dijangkau.")
 
 
+def check_simulator_enabled(engine) -> bool:
+    """Memeriksa apakah simulator aktif/nonaktif dari tabel darsi_settings."""
+    try:
+        with engine.connect() as conn:
+            # Pastikan tabel settings ada
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS darsi_settings (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value VARCHAR(50) NOT NULL
+                )
+            """))
+            conn.commit()
+
+            # Pastikan nilai default ada
+            conn.execute(text("""
+                INSERT INTO darsi_settings (key, value)
+                VALUES ('simulator_enabled', 'true')
+                ON CONFLICT (key) DO NOTHING
+            """))
+            conn.commit()
+
+            val = conn.execute(
+                text("SELECT value FROM darsi_settings WHERE key = 'simulator_enabled'")
+            ).scalar()
+            return val == "true"
+    except Exception as e:
+        print(f"[WARN] Gagal membaca status simulator: {e}", flush=True)
+        return True
+
+
 def main() -> None:
     print("=" * 50, flush=True)
     print("DARSI SIMRS Simulator", flush=True)
@@ -348,7 +378,10 @@ def main() -> None:
 
     while True:
         try:
-            run_once(engine)
+            if check_simulator_enabled(engine):
+                run_once(engine)
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Simulator DINONAKTIFKAN via Settings. Menunggu...", flush=True)
         except Exception as err:
             print(f"[ERROR] {err}", flush=True)
         time.sleep(INTERVAL_SECONDS)

@@ -10,8 +10,8 @@ Endpoint:
 
 from __future__ import annotations
 
+import asyncio
 import os
-import subprocess
 import sys
 from datetime import datetime
 from typing import Any
@@ -38,33 +38,57 @@ SCRIPT_ENV = {
     "OLLAMA_MODEL": os.getenv("OLLAMA_MODEL", "qwen3.5:2b"),
 }
 
+# Per-script locks prevent duplicate concurrent runs (e.g. n8n cron + manual trigger).
+_SCRIPT_LOCKS: dict[str, asyncio.Lock] = {}
 
-def _run_script(script_name: str, *args: str) -> dict[str, Any]:
-    """Jalankan script Python di processors/ sebagai subprocess."""
-    script_path = f"{PROCESSORS_DIR}/{script_name}"
-    cmd = [sys.executable, script_path] + list(args)
-    started_at = datetime.now()
 
-    result = subprocess.run(cmd, env=SCRIPT_ENV, capture_output=True, text=True)
+def _get_lock(script_name: str) -> asyncio.Lock:
+    if script_name not in _SCRIPT_LOCKS:
+        _SCRIPT_LOCKS[script_name] = asyncio.Lock()
+    return _SCRIPT_LOCKS[script_name]
 
-    duration_ms = int((datetime.now() - started_at).total_seconds() * 1000)
 
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "script": script_name,
-                "stderr": result.stderr[-2000:],
-                "duration_ms": duration_ms,
-            },
+async def _run_script(script_name: str, *args: str) -> dict[str, Any]:
+    """Jalankan script Python di processors/ sebagai subprocess non-blocking.
+
+    Menggunakan asyncio.create_subprocess_exec sehingga event loop tidak
+    pernah terblokir selama script berjalan. Lock per-script memastikan hanya
+    satu instance script yang sama berjalan pada satu waktu.
+    """
+    lock = _get_lock(script_name)
+    async with lock:
+        script_path = f"{PROCESSORS_DIR}/{script_name}"
+        cmd = [sys.executable, script_path] + list(args)
+        started_at = datetime.now()
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=SCRIPT_ENV,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout_bytes, stderr_bytes = await proc.communicate()
 
-    return {
-        "script": script_name,
-        "status": "ok",
-        "duration_ms": duration_ms,
-        "stdout": result.stdout[-1000:],
-    }
+        duration_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+        stdout = stdout_bytes.decode(errors="replace")
+        stderr = stderr_bytes.decode(errors="replace")
+
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "script": script_name,
+                    "stderr": stderr[-2000:],
+                    "duration_ms": duration_ms,
+                },
+            )
+
+        return {
+            "script": script_name,
+            "status": "ok",
+            "duration_ms": duration_ms,
+            "stdout": stdout[-1000:],
+        }
 
 
 @app.get("/health")
@@ -75,19 +99,19 @@ async def health() -> dict[str, str]:
 @app.post("/pipeline/refine")
 async def refine() -> dict[str, Any]:
     """Pandas refinement: raw_* → refined_* di PostgreSQL."""
-    return _run_script("refine_postgres_internal.py")
+    return await _run_script("refine_postgres_internal.py")
 
 
 @app.post("/pipeline/sync")
 async def sync() -> dict[str, Any]:
     """Sync refined_* PostgreSQL → clean_* SurrealDB."""
-    return _run_script("refine_raw_to_surrealdb.py", "--apply")
+    return await _run_script("refine_raw_to_surrealdb.py", "--apply")
 
 
 @app.post("/pipeline/embed")
 async def embed() -> dict[str, Any]:
     """Generate embedding clean_* → SurrealDB vector index."""
-    return _run_script("embed_to_surrealdb_vector.py")
+    return await _run_script("embed_to_surrealdb_vector.py")
 
 
 @app.post("/pipeline/run-all")
@@ -102,7 +126,7 @@ async def run_all() -> dict[str, Any]:
         ("embed_to_surrealdb_vector.py", []),
     ]:
         try:
-            result = _run_script(script, *args)
+            result = await _run_script(script, *args)
             results.append(result)
         except HTTPException as err:
             return {
