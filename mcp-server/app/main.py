@@ -11,6 +11,8 @@ Endpoint:
     GET  /mcp/analytics/cost-by-category → biaya operasional per kategori.
     GET  /mcp/analytics/occupancy-by-unit→ okupansi bed per unit.
     GET  /mcp/analytics/utility-trend    → tren konsumsi listrik & air per unit.
+    GET  /mcp/analytics/efficiency       → cost-per-service & cost-to-revenue ratio per unit.
+    GET  /mcp/analytics/staffing         → shift coverage vs overtime per unit.
     GET  /mcp/summary/resource           → ringkasan utilitas resource per unit.
     GET  /mcp/summary/cost               → ringkasan biaya per unit & kategori.
 """
@@ -112,6 +114,36 @@ DOMAINS: dict[str, dict[str, Any]] = {
         "vector": "vector_darsi_jadwal_alat_berat",
         "keywords": ["alat berat", "jadwal", "mri", "ct scan", "rontgen", "device"],
         "summary": "SELECT device_name, count() AS total FROM clean_jadwal_alat_berat GROUP BY device_name;",
+    },
+    "kunjungan_layanan": {
+        "surreal": "clean_kunjungan_layanan",
+        "vector": "vector_darsi_kunjungan_layanan",
+        "keywords": ["kunjungan", "pasien baru", "tindakan", "rawat jalan", "rawat inap", "igd", "operasi", "throughput"],
+        "summary": "SELECT unit_code, layanan_type, math::sum(jumlah_kunjungan) AS total_kunjungan, math::sum(jumlah_tindakan) AS total_tindakan FROM clean_kunjungan_layanan GROUP BY unit_code, layanan_type;",
+    },
+    "pendapatan_unit": {
+        "surreal": "clean_pendapatan_unit",
+        "vector": "vector_darsi_pendapatan_unit",
+        "keywords": ["pendapatan", "revenue", "pemasukan", "penerimaan", "bpjs", "tarif layanan"],
+        "summary": "SELECT unit_code, payer_type, math::sum(amount_idr) AS total_revenue, math::sum(target_idr) AS total_target FROM clean_pendapatan_unit GROUP BY unit_code, payer_type;",
+    },
+    "jadwal_staf": {
+        "surreal": "clean_jadwal_staf",
+        "vector": "vector_darsi_jadwal_staf",
+        "keywords": ["jadwal staf", "shift", "absensi", "kehadiran", "perawat shift", "jam kerja"],
+        "summary": "SELECT unit_code, shift_type, count() AS total_shift, math::sum(scheduled_hours) AS scheduled_hours, math::sum(actual_hours) AS actual_hours FROM clean_jadwal_staf GROUP BY unit_code, shift_type;",
+    },
+    "downtime_alat": {
+        "surreal": "clean_downtime_alat",
+        "vector": "vector_darsi_downtime_alat",
+        "keywords": ["downtime", "kerusakan alat", "alat rusak", "maintenance alat", "perbaikan", "unplanned"],
+        "summary": "SELECT device_name, downtime_type, count() AS total_event, math::sum(repair_cost_idr) AS total_repair_cost FROM clean_downtime_alat GROUP BY device_name, downtime_type;",
+    },
+    "tarif_utilitas": {
+        "surreal": "clean_tarif_utilitas",
+        "vector": "vector_darsi_tarif_utilitas",
+        "keywords": ["tarif listrik", "tarif air", "harga kwh", "harga air", "pln tarif", "pdam tarif"],
+        "summary": "SELECT utility_type, tariff_per_unit, unit_uom, effective_date FROM clean_tarif_utilitas ORDER BY effective_date DESC LIMIT 10;",
     },
 }
 
@@ -484,6 +516,132 @@ async def analytics_utility_trend() -> dict[str, Any]:
     except Exception:
         air = []
     return {"listrik": listrik, "air": air}
+
+
+@app.get("/mcp/analytics/efficiency")
+async def analytics_efficiency() -> dict[str, Any]:
+    """Cost efficiency per unit: cost-per-service dan cost-to-revenue ratio.
+
+    Menggabungkan raw_biaya_operasional (cost), raw_kunjungan_layanan (volume),
+    dan raw_pendapatan_unit (revenue) untuk menghasilkan metrik efisiensi per unit.
+    """
+    try:
+        cost_rows = await _query_surrealdb(
+            "SELECT unit_code, math::sum(amount_idr) AS total_cost"
+            " FROM clean_biaya_operasional GROUP BY unit_code"
+        )
+    except Exception:
+        cost_rows = []
+
+    try:
+        visit_rows = await _query_surrealdb(
+            "SELECT unit_code, math::sum(jumlah_kunjungan) AS total_kunjungan,"
+            " math::sum(jumlah_tindakan) AS total_tindakan"
+            " FROM clean_kunjungan_layanan GROUP BY unit_code"
+        )
+    except Exception:
+        visit_rows = []
+
+    try:
+        revenue_rows = await _query_surrealdb(
+            "SELECT unit_code, math::sum(amount_idr) AS total_revenue,"
+            " math::sum(target_idr) AS total_target"
+            " FROM clean_pendapatan_unit GROUP BY unit_code"
+        )
+    except Exception:
+        revenue_rows = []
+
+    cost_map = {r["unit_code"]: r.get("total_cost", 0) for r in cost_rows if "unit_code" in r}
+    visit_map = {r["unit_code"]: r for r in visit_rows if "unit_code" in r}
+    revenue_map = {r["unit_code"]: r for r in revenue_rows if "unit_code" in r}
+
+    all_units = set(cost_map) | set(visit_map) | set(revenue_map)
+    units: list[dict[str, Any]] = []
+    for unit in sorted(all_units):
+        cost = cost_map.get(unit, 0) or 0
+        kunjungan = (visit_map.get(unit) or {}).get("total_kunjungan") or 0
+        tindakan = (visit_map.get(unit) or {}).get("total_tindakan") or 0
+        revenue = (revenue_map.get(unit) or {}).get("total_revenue") or 0
+        target = (revenue_map.get(unit) or {}).get("total_target") or 0
+
+        cost_per_kunjungan = round(cost / kunjungan, 2) if kunjungan else None
+        cost_per_tindakan = round(cost / tindakan, 2) if tindakan else None
+        cost_to_revenue = round(cost / revenue * 100, 2) if revenue else None
+        revenue_achievement = round(revenue / target * 100, 2) if target else None
+
+        units.append({
+            "unit_code": unit,
+            "total_cost_idr": cost,
+            "total_kunjungan": kunjungan,
+            "total_tindakan": tindakan,
+            "total_revenue_idr": revenue,
+            "cost_per_kunjungan_idr": cost_per_kunjungan,
+            "cost_per_tindakan_idr": cost_per_tindakan,
+            "cost_to_revenue_pct": cost_to_revenue,
+            "revenue_achievement_pct": revenue_achievement,
+        })
+
+    return {"units": units}
+
+
+@app.get("/mcp/analytics/staffing")
+async def analytics_staffing() -> dict[str, Any]:
+    """Staffing optimization: shift coverage vs overtime per unit.
+
+    Menggabungkan raw_jadwal_staf (shift reguler) dan raw_lembur_staf (overtime)
+    untuk mendeteksi unit yang overstaffed, understaffed, atau bergantung pada lembur.
+    """
+    try:
+        shift_rows = await _query_surrealdb(
+            "SELECT unit_code, math::sum(scheduled_hours) AS scheduled_hours,"
+            " math::sum(actual_hours) AS actual_hours,"
+            " count() AS total_shift,"
+            " math::sum(IF absent THEN 1 ELSE 0 END) AS total_absent"
+            " FROM clean_jadwal_staf GROUP BY unit_code"
+        )
+    except Exception:
+        shift_rows = []
+
+    try:
+        overtime_rows = await _query_surrealdb(
+            "SELECT unit_code, math::sum(overtime_hours) AS overtime_hours,"
+            " math::sum(overtime_cost_idr) AS overtime_cost"
+            " FROM clean_lembur_staf GROUP BY unit_code"
+        )
+    except Exception:
+        overtime_rows = []
+
+    shift_map = {r["unit_code"]: r for r in shift_rows if "unit_code" in r}
+    overtime_map = {r["unit_code"]: r for r in overtime_rows if "unit_code" in r}
+
+    all_units = set(shift_map) | set(overtime_map)
+    units: list[dict[str, Any]] = []
+    for unit in sorted(all_units):
+        shift = shift_map.get(unit) or {}
+        ot = overtime_map.get(unit) or {}
+
+        scheduled = shift.get("scheduled_hours") or 0
+        actual = shift.get("actual_hours") or 0
+        overtime = ot.get("overtime_hours") or 0
+        total_shift = shift.get("total_shift") or 0
+        total_absent = shift.get("total_absent") or 0
+
+        attendance_rate = round((1 - total_absent / total_shift) * 100, 2) if total_shift else None
+        overtime_ratio = round(overtime / actual * 100, 2) if actual else None
+
+        units.append({
+            "unit_code": unit,
+            "scheduled_hours": scheduled,
+            "actual_hours": actual,
+            "overtime_hours": overtime,
+            "overtime_cost_idr": ot.get("overtime_cost") or 0,
+            "total_shift": total_shift,
+            "total_absent": total_absent,
+            "attendance_rate_pct": attendance_rate,
+            "overtime_ratio_pct": overtime_ratio,
+        })
+
+    return {"units": units}
 
 
 # ─── Summary ──────────────────────────────────────────────────────────────────

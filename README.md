@@ -103,15 +103,16 @@ darsi/
 ├── pipeline/                        # Script data processing
 │   ├── requirements.txt
 │   ├── processors/                  # Script refinement (dipanggil pipeline-service)
-│   │   ├── simrs_simulator.py           # Simulator SIMRS real-time (setiap 10 detik)
+│   │   ├── simrs_simulator.py           # Simulator SIMRS real-time (setiap 10 detik, 13 domain)
 │   │   ├── generate_bulk_dummy_data.py
 │   │   ├── refine_postgres_internal.py
 │   │   ├── refine_raw_to_surrealdb.py
 │   │   ├── embed_to_surrealdb_vector.py # Embedding ke SurrealDB vector store
 │   │   └── ...
 │   └── data/
-│       ├── sample_simrs/            # CSV dummy SIMRS (8 domain)
-│       └── sql/                     # Schema SQL PostgreSQL
+│       ├── sample_simrs/            # CSV dummy SIMRS (13 domain)
+│       └── sql/
+│           └── raw_operational_schema.sql  # Schema 13 tabel raw_* + seed tarif (1 file, 1x eksekusi)
 ├── n8n/
 │   └── darsi_pipeline_workflow.json # Workflow n8n siap import
 ├── frontend/                        # React Frontend (Vite + React 18)
@@ -127,7 +128,7 @@ darsi/
 │       ├── api.js                   # apiFetch, apiPost, useApi hook
 │       ├── utils.js                 # fmtRp, fmtNum, fmtPct, PALETTE
 │       └── pages/
-│           ├── Dashboard.jsx        # KPI cards + 3 charts
+│           ├── Dashboard.jsx        # 8 KPI cards + 5 charts (incl. cost-to-revenue & staffing)
 │           ├── Analytics.jsx        # Charts detail + tabel breakdown
 │           ├── Chat.jsx             # Chat AI dengan RAG toggle
 │           ├── Summary.jsx          # Ringkasan utilitas & biaya per unit
@@ -192,13 +193,13 @@ docker exec -it darsi-ollama ollama pull nomic-embed-text  # model embedding RAG
 ## MVP Features
 
 - [x] Docker infrastructure setup (11 services)
-- [x] SIMRS data simulator real-time (setiap 10 detik, 1–100 record/domain)
+- [x] SIMRS data simulator real-time (setiap 10 detik, 1–100 record/domain, 13 domain)
 - [x] Pipeline Service (FastAPI: /refine, /sync, /embed, /run-all)
 - [x] n8n workflow JSON (siap import, cron 1 menit → pipeline-service)
 - [x] MCP Server (Data Connector + Context Manager + LLM generation via LangChain)
-- [x] FastAPI backend endpoints (analytics, chat, summary, rag, data, health)
+- [x] FastAPI backend endpoints (analytics: overview, cost-by-category, occupancy, utility-trend, efficiency, staffing — chat, summary, rag, data, health)
 - [x] React frontend (Vite + React 18, SPA, 6 halaman)
-- [x] Dashboard KPI + 3 chart operasional (Chart.js)
+- [x] Dashboard 8 KPI card + 5 chart operasional (Chart.js) — incl. cost-to-revenue ratio & staffing overview
 - [x] Chat interface dengan RAG toggle + typing indicator
 - [x] Ringkasan utilitas & biaya per unit (tabel + progress bar)
 - [x] Metabase embedded via iframe
@@ -221,12 +222,37 @@ MCP Server dalam DARSI memiliki tiga fungsi utama:
 
 ---
 
+## Database Schema — raw_* Tables (13 Domain)
+
+Schema PostgreSQL tersedia dalam satu file: `pipeline/data/sql/raw_operational_schema.sql`.
+Cukup dieksekusi 1x — mencakup DDL semua tabel + seed data statis tarif utilitas.
+
+| # | Tabel | Sumber | Isi |
+| --- | --- | --- | --- |
+| 1 | `raw_pasien_aktif` | SIMRS | Snapshot pasien aktif: unit, kelas kamar, payer, kode diagnosis |
+| 2 | `raw_okupansi_kamar` | SIMRS | Status kamar per observasi: kapasitas bed, terisi, kosong, maintenance |
+| 3 | `raw_meter_listrik` | Utility Meter | Pembacaan kWh per meter per gedung/lantai: voltase, arus, power factor |
+| 4 | `raw_konsumsi_air` | Water Meter | Volume air (m³) per meter per unit: tekanan rata-rata |
+| 5 | `raw_biaya_operasional_unit` | Finance | Realisasi vs budget biaya per unit per bulan per kategori |
+| 6 | `raw_konsumsi_obat_alkes` | Pharmacy | Pemakaian obat & alkes: item, qty, unit cost, total cost |
+| 7 | `raw_lembur_staf` | HR | Biaya lembur staf: jam lembur, unit, alasan |
+| 8 | `raw_jadwal_alat_berat` | Biomedik | Jadwal alat medis berat: start/end, status, operator |
+| 9 | `raw_kunjungan_layanan` | SIMRS | Volume kunjungan & tindakan per unit per hari per payer — *denominator cost efficiency* |
+| 10 | `raw_pendapatan_unit` | Finance | Revenue per unit per bulan per kategori & payer — *sisi revenue cost-to-revenue ratio* |
+| 11 | `raw_jadwal_staf` | HR | Shift reguler staf: jadwal vs realisasi jam, ketidakhadiran — *dasar staffing optimization* |
+| 12 | `raw_downtime_alat` | Biomedik | Downtime & kerusakan alat: tipe, severity, biaya perbaikan — *biaya tersembunyi* |
+| 13 | `raw_tarif_utilitas` | Finance | Tarif listrik (kWh→IDR) & air (m³→IDR) per periode — *konversi volume ke biaya aktual* |
+
+Domain 1–8 menangani monitoring operasional harian. Domain 9–13 mengaktifkan analisis **resource optimization** dan **cost efficiency** oleh AI layer.
+
+---
+
 ## Data Flow
 
 ```
 [SIMRS Simulator] — insert 1–100 record/domain setiap 10 detik
       ↓
-[PostgreSQL] — raw_* tables (8 domain SIMRS)
+[PostgreSQL] — raw_* tables (13 domain)
       ↓
 [n8n] — cron trigger setiap 1 menit
       ↓ HTTP POST

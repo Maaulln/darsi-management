@@ -49,12 +49,14 @@ const STACKED_OPTS = {
 };
 
 export default function Dashboard() {
-  const { data: overview, loading: l1 } = useApi('/api/analytics/overview');
-  const { data: costData, loading: l2 } = useApi('/api/analytics/cost-by-category');
-  const { data: occData, loading: l3 } = useApi('/api/analytics/occupancy-by-unit');
-  const { data: utilData, loading: l4 } = useApi('/api/analytics/utility-trend');
+  const { data: overview,    loading: l1 } = useApi('/api/analytics/overview');
+  const { data: costData,    loading: l2 } = useApi('/api/analytics/cost-by-category');
+  const { data: occData,     loading: l3 } = useApi('/api/analytics/occupancy-by-unit');
+  const { data: utilData,    loading: l4 } = useApi('/api/analytics/utility-trend');
+  const { data: effData,     loading: l5 } = useApi('/api/analytics/efficiency');
+  const { data: staffData,   loading: l6 } = useApi('/api/analytics/staffing');
 
-  if (l1 || l2 || l3 || l4) {
+  if (l1 || l2 || l3 || l4 || l5 || l6) {
     return (
       <div className="loader">
         <div className="spinner" />
@@ -64,6 +66,18 @@ export default function Dashboard() {
   }
 
   const kpi = overview?.kpi ?? {};
+
+  // ── Derived KPI dari efficiency & staffing ──────────────────────────────────
+  const effUnits = effData?.units ?? [];
+  const staffUnits = staffData?.units ?? [];
+
+  const avgCostToRevenue = effUnits.length
+    ? effUnits.reduce((s, u) => s + (u.cost_to_revenue_pct ?? 0), 0) / effUnits.filter(u => u.cost_to_revenue_pct != null).length
+    : null;
+
+  const avgOvertimeRatio = staffUnits.length
+    ? staffUnits.reduce((s, u) => s + (u.overtime_ratio_pct ?? 0), 0) / staffUnits.filter(u => u.overtime_ratio_pct != null).length
+    : null;
 
   const kpiCards = [
     { label: 'Pasien Aktif', value: fmtNum(kpi.pasien_aktif), color: '#2563eb' },
@@ -86,6 +100,18 @@ export default function Dashboard() {
       value: `${fmtNum(kpi.overtime_hours, 1)} jam`,
       sub: fmtRp(kpi.overtime_cost_idr),
       color: '#dc2626',
+    },
+    {
+      label: 'Cost-to-Revenue Ratio',
+      value: avgCostToRevenue != null ? fmtPct(avgCostToRevenue) : '—',
+      sub: 'Rata-rata biaya vs pendapatan per unit',
+      color: avgCostToRevenue > 100 ? '#dc2626' : '#16a34a',
+    },
+    {
+      label: 'Overtime Ratio',
+      value: avgOvertimeRatio != null ? fmtPct(avgOvertimeRatio) : '—',
+      sub: 'Rata-rata lembur vs jam kerja reguler',
+      color: avgOvertimeRatio > 20 ? '#d97706' : '#059669',
     },
   ];
 
@@ -142,6 +168,60 @@ export default function Dashboard() {
     ],
   };
 
+  // Cost-to-Revenue bar per unit
+  const effLabels = effUnits.map(u => u.unit_code);
+  const effChartData = {
+    labels: effLabels,
+    datasets: [
+      {
+        label: 'Cost-to-Revenue (%)',
+        data: effUnits.map(u => u.cost_to_revenue_pct ?? 0),
+        backgroundColor: effUnits.map(u =>
+          (u.cost_to_revenue_pct ?? 0) > 100 ? '#dc2626' : '#16a34a'
+        ),
+        borderRadius: 4,
+      },
+    ],
+  };
+  const effChartOpts = {
+    ...BAR_OPTS,
+    plugins: {
+      ...BAR_OPTS.plugins,
+      annotation: {
+        annotations: {
+          breakeven: {
+            type: 'line',
+            yMin: 100,
+            yMax: 100,
+            borderColor: '#64748b',
+            borderWidth: 1,
+            borderDash: [4, 4],
+          },
+        },
+      },
+    },
+  };
+
+  // Staffing grouped bar per unit
+  const staffLabels = staffUnits.map(u => u.unit_code);
+  const staffChartData = {
+    labels: staffLabels,
+    datasets: [
+      {
+        label: 'Jam Reguler',
+        data: staffUnits.map(u => u.actual_hours ?? 0),
+        backgroundColor: '#2563eb',
+        borderRadius: 3,
+      },
+      {
+        label: 'Jam Lembur',
+        data: staffUnits.map(u => u.overtime_hours ?? 0),
+        backgroundColor: '#dc2626',
+        borderRadius: 3,
+      },
+    ],
+  };
+
   return (
     <div>
       <div className="kpi-grid">
@@ -174,6 +254,18 @@ export default function Dashboard() {
         <ChartCard title="Konsumsi Utilitas per Unit" className="full">
           {utilUnits.length > 0
             ? <Bar data={utilChartData} options={BAR_OPTS} />
+            : <EmptyChart />}
+        </ChartCard>
+
+        <ChartCard title="Cost-to-Revenue Ratio per Unit" className="full">
+          {effUnits.length > 0
+            ? <Bar data={effChartData} options={effChartOpts} />
+            : <EmptyChart />}
+        </ChartCard>
+
+        <ChartCard title="Jam Kerja vs Lembur per Unit" className="full">
+          {staffUnits.length > 0
+            ? <Bar data={staffChartData} options={STACKED_OPTS} />
             : <EmptyChart />}
         </ChartCard>
       </div>

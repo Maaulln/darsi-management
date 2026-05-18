@@ -82,7 +82,7 @@ Pattern utama yang digunakan:
 ║   │  Port 5432   │   │ Port 5678   │  │  Port 8200   │  │  Port 8001   │  ║
 ║   │              │   │             │  │              │  │              │  ║
 ║   │  raw_* tables│   │ Cron 1 mnt  │  │ POST /refine │  │  clean_*     │  ║
-║   │  8 domain    │   │ HTTP trigger│─►│ POST /sync   │─►│  + Vector    │  ║
+║   │  13 domain   │   │ HTTP trigger│─►│ POST /sync   │─►│  + Vector    │  ║
 ║   └──────┬───────┘   └─────────────┘  │ POST /embed  │  │  Index HNSW  │  ║
 ║          │◄──────────────────────────  └──────────────┘  └──────────────┘  ║
 ║          ▲                                                                  ║
@@ -104,6 +104,8 @@ Terdiri dari dua komponen yang bekerja bersama dalam satu tampilan:
 
 **React Frontend**
 Menangani semua interaksi pengguna yang bersifat dinamis dan AI-driven. Komponen utamanya meliputi chat interface untuk bertanya ke LLM (qwen3.5:2b via MCP Server), tampilan ringkasan analitik hasil AI, dan wrapper container untuk embed Metabase.
+
+Dashboard menampilkan **8 KPI card** (pasien aktif, BOR, total biaya, listrik, air, lembur, cost-to-revenue ratio, overtime ratio) dan **5 chart** (biaya per kategori, okupansi bed per unit, utilitas per unit, cost-to-revenue per unit, jam kerja vs lembur per unit). Dua KPI dan dua chart terakhir berasal dari endpoint analytics efisiensi yang hanya bisa dihitung setelah domain 9–13 tersedia.
 
 **Metabase (Self-hosted, Port 3001)**
 Ditanamkan (embedded) ke dalam React melalui iframe menggunakan fitur Metabase Embedding. Metabase bertugas khusus untuk visualisasi data reporting — chart penggunaan fasilitas, tren layanan, konsumsi utilitas — dengan query langsung ke PostgreSQL dan SurrealDB.
@@ -164,7 +166,22 @@ Ini adalah layer paling kritis dalam arsitektur DARSI. Terdiri dari tiga kompone
 Memiliki tiga fungsi yang berjalan dalam satu service:
 
 *Fungsi 1 — Data Connector:*
-Melakukan structured query ke SurrealDB (`SELECT ... GROUP BY ...`) untuk mengambil data agregat operasional per domain — pasien, okupansi, biaya, utilitas, dll. Hasil query diformat menjadi konteks teks untuk RAG.
+Melakukan structured query ke SurrealDB (`SELECT ... GROUP BY ...`) untuk mengambil data agregat operasional per domain — 13 domain mencakup pasien, okupansi, utilitas, biaya, farmasi, SDM, alat medis, kunjungan layanan, pendapatan, jadwal staf, downtime alat, dan tarif utilitas. Hasil query diformat menjadi konteks teks untuk RAG.
+
+Domain registry MCP Server memetakan setiap domain ke tiga properti: `surreal` (nama tabel `clean_*` di SurrealDB), `vector` (nama vector index HNSW), dan `keywords` (untuk intent detection pada query pengguna).
+
+Endpoint analytics yang tersedia:
+
+| Endpoint | Fungsi |
+| --- | --- |
+| `GET /mcp/analytics/overview` | KPI agregat semua domain (pasien, BOR, biaya, utilitas, lembur) |
+| `GET /mcp/analytics/cost-by-category` | Breakdown biaya operasional per kategori |
+| `GET /mcp/analytics/occupancy-by-unit` | Okupansi bed per unit |
+| `GET /mcp/analytics/utility-trend` | Konsumsi listrik & air per unit |
+| `GET /mcp/analytics/efficiency` | Cost-per-service & cost-to-revenue ratio per unit (join domain 5, 9, 10) |
+| `GET /mcp/analytics/staffing` | Shift coverage vs overtime ratio per unit (join domain 7, 11) |
+| `GET /mcp/summary/resource` | Ringkasan utilitas resource per unit |
+| `GET /mcp/summary/cost` | Ringkasan biaya per unit & kategori |
 
 *Fungsi 2 — Context Manager:*
 Melakukan vector similarity search ke SurrealDB vector index (`vector::similarity::cosine`) berdasarkan query semantik pengguna. Menggabungkan hasil structured query dan semantic search menjadi satu konteks terstruktur yang siap dikonsumsi LLM.
@@ -197,7 +214,27 @@ Ollama berjalan sepenuhnya lokal di private cloud — tidak ada data yang keluar
 ### 5. Data Layer
 
 **PostgreSQL (Port 5432)**
-Menyimpan data mentah SIMRS dalam skema relasional (`raw_*` tables, 8 domain). Data terus-menerus diisi oleh SIMRS Simulator setiap 10 detik.
+Menyimpan data mentah SIMRS dalam skema relasional (`raw_*` tables, 13 domain). Data terus-menerus diisi oleh SIMRS Simulator setiap 10 detik. Schema seluruh tabel tersedia dalam satu file: `pipeline/data/sql/raw_operational_schema.sql` (mencakup DDL + seed data statis tarif utilitas, cukup dieksekusi 1x).
+
+**Tabel raw_* — 13 Domain:**
+
+| # | Tabel | Sumber | Isi |
+| --- | --- | --- | --- |
+| 1 | `raw_pasien_aktif` | SIMRS | Snapshot pasien yang sedang dirawat: unit, kelas, payer, kode diagnosis |
+| 2 | `raw_okupansi_kamar` | SIMRS | Status tiap kamar: kapasitas bed, terisi, kosong, maintenance |
+| 3 | `raw_meter_listrik` | Utility Meter | Pembacaan kWh per meter per gedung/lantai: voltase, arus, power factor |
+| 4 | `raw_konsumsi_air` | Water Meter | Volume air (m³) per meter per unit: tekanan rata-rata |
+| 5 | `raw_biaya_operasional_unit` | Finance | Realisasi vs budget biaya per unit per bulan: kategori biaya |
+| 6 | `raw_konsumsi_obat_alkes` | Pharmacy | Pemakaian obat & alat kesehatan: item, qty, unit cost, total cost |
+| 7 | `raw_lembur_staf` | HR | Biaya lembur staf per orang per hari: jam lembur, alasan |
+| 8 | `raw_jadwal_alat_berat` | Biomedik | Jadwal pemakaian alat medis berat: start/end, status, operator |
+| 9 | `raw_kunjungan_layanan` | SIMRS | Volume kunjungan & tindakan per unit per hari per payer — **denominator cost efficiency** |
+| 10 | `raw_pendapatan_unit` | Finance | Revenue per unit per bulan per kategori & payer — **sisi revenue cost-to-revenue ratio** |
+| 11 | `raw_jadwal_staf` | HR | Shift reguler staf: jadwal vs realisasi jam kerja, ketidakhadiran — **dasar staffing optimization** |
+| 12 | `raw_downtime_alat` | Biomedik | Downtime & kerusakan alat: tipe (planned/unplanned), severity, biaya perbaikan — **biaya tersembunyi** |
+| 13 | `raw_tarif_utilitas` | Finance | Tarif listrik (kWh→IDR) & air (m³→IDR) per periode — **konversi volume fisik ke biaya aktual** |
+
+Domain 1–8 menangani monitoring operasional harian. Domain 9–13 ditambahkan khusus untuk mengaktifkan kemampuan AI dalam menghitung metrik **resource optimization** (staffing ratio, equipment utilization) dan **cost efficiency** (cost-per-service, cost-to-revenue ratio, biaya utilitas aktual).
 
 **SIMRS Simulator (Docker service, no exposed port)**
 Service Python yang berjalan terus-menerus (`restart: unless-stopped`). Setiap 10 detik menginsert 1–100 record acak per domain ke tabel `raw_*` PostgreSQL — mensimulasikan aliran data real-time dari SIMRS rumah sakit.
