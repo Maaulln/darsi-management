@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+node_modules/
+postgres_data/
+ollama_data/
