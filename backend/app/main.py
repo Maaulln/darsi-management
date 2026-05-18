@@ -8,6 +8,7 @@ from app.api.chat import router as chat_router
 from app.api.data import router as data_router
 from app.api.health import router as health_router
 from app.api.rag import router as rag_router
+from app.api.settings import router as settings_router
 from app.api.summary import router as summary_router
 from app.core.config import settings
 
@@ -29,6 +30,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(rag_router)
     app.include_router(analytics_router)
+    app.include_router(settings_router)
     return app
 
 

@@ -20,34 +20,50 @@ DOMAIN_QUERY: Final[dict[str, str]] = {
     "pasien_aktif": """
         SELECT snapshot_at, patient_id, unit_code, room_code, class_code, status_aktif, diagnosis_code
         FROM refined_pasien_aktif
+        ORDER BY snapshot_at DESC
+        LIMIT 10000
     """,
     "okupansi_kamar": """
         SELECT observed_at, room_id, unit_code, room_class, bed_capacity, bed_occupied, room_status
         FROM refined_okupansi_kamar
+        ORDER BY observed_at DESC
+        LIMIT 10000
     """,
     "meter_listrik": """
         SELECT reading_at, meter_id, building_code, floor_code, unit_code, kwh_total
         FROM refined_meter_listrik
+        ORDER BY reading_at DESC
+        LIMIT 10000
     """,
     "konsumsi_air": """
         SELECT reading_at, meter_id, building_code, unit_code, volume_m3_total
         FROM refined_konsumsi_air
+        ORDER BY reading_at DESC
+        LIMIT 10000
     """,
     "biaya_operasional": """
         SELECT period_month, unit_code, cost_category, amount_idr, budget_idr
         FROM refined_biaya_operasional_unit
+        ORDER BY period_month DESC
+        LIMIT 10000
     """,
     "konsumsi_obat_alkes": """
         SELECT usage_at, period_month, unit_code, item_code, item_name, item_type, quantity, total_cost_idr
         FROM refined_konsumsi_obat_alkes
+        ORDER BY usage_at DESC
+        LIMIT 10000
     """,
     "lembur_staf": """
         SELECT overtime_date, unit_code, staff_id, role_name, overtime_hours, overtime_cost_idr
         FROM refined_lembur_staf
+        ORDER BY overtime_date DESC
+        LIMIT 10000
     """,
     "jadwal_alat_berat": """
         SELECT schedule_start, schedule_end, device_id, device_name, unit_code, schedule_type, status
         FROM refined_jadwal_alat_berat
+        ORDER BY schedule_start DESC
+        LIMIT 10000
     """,
 }
 
@@ -119,7 +135,7 @@ def transform_to_clean_records(dataframe: pd.DataFrame) -> list[dict[str, object
     return normalized_frame.to_dict(orient="records")
 
 
-_BATCH_SIZE: Final[int] = 50
+_BATCH_SIZE: Final[int] = 1000
 
 
 def build_domain_init_query(domain_name: str) -> str:
@@ -127,11 +143,8 @@ def build_domain_init_query(domain_name: str) -> str:
 
 
 def build_domain_batch_query(domain_name: str, records: list[dict[str, object]]) -> str:
-    statements = []
-    for record in records:
-        json_payload = json.dumps(record, default=str, ensure_ascii=True)
-        statements.append(f"CREATE clean_{domain_name} CONTENT {json_payload};")
-    return " ".join(statements)
+    json_payload = json.dumps(records, default=str, ensure_ascii=True)
+    return f"INSERT INTO clean_{domain_name} {json_payload};"
 
 
 def validate_surreal_sql_response(response: requests.Response, domain_name: str) -> None:
@@ -190,13 +203,15 @@ def send_to_surrealdb(domain_name: str, records: list[dict[str, object]]) -> Non
         "DB": surreal_database,
     }
 
+    session = requests.Session()
+    session.auth = (surreal_user, surreal_password)
+    session.headers.update(headers)
+
     def _post(query: str) -> None:
         try:
-            response = requests.post(
+            response = session.post(
                 surreal_endpoint,
                 data=query,
-                headers=headers,
-                auth=(surreal_user, surreal_password),
                 timeout=60,
             )
             response.raise_for_status()
