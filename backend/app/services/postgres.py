@@ -19,15 +19,22 @@ def init_settings_db() -> None:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS darsi_settings (
                 key VARCHAR(50) PRIMARY KEY,
-                value VARCHAR(50) NOT NULL
+                value TEXT NOT NULL
             )
         """))
+        try:
+            conn.execute(text("ALTER TABLE darsi_settings ALTER COLUMN value TYPE TEXT;"))
+        except Exception:
+            pass
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS darsi_incoming_apis (
                 id SERIAL PRIMARY KEY,
                 name VARCHAR(100) NOT NULL,
-                endpoint VARCHAR(255) NOT NULL,
-                metabase_url VARCHAR(255) NOT NULL,
+                endpoint VARCHAR(255) NOT NULL UNIQUE,
+                external_url TEXT,
+                metabase_url TEXT,
+                raw_data JSONB,
+                last_fetched TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))

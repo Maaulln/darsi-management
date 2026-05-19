@@ -59,9 +59,49 @@ _PROMPT_TEMPLATE = PromptTemplate.from_template(
 )
 
 
-def _build_chain():
-    llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=OLLAMA_MODEL, timeout=120)
-    return _PROMPT_TEMPLATE | llm | StrOutputParser()
+async def _get_ai_config() -> tuple[str, str]:
+    url = OLLAMA_BASE_URL
+    model = OLLAMA_MODEL
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            r = await client.get("http://backend:8000/api/settings/ai")
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("url"):
+                    u = data["url"].strip()
+                    if u.endswith("/"): u = u[:-1]
+                    if u.endswith("/api/generate"): u = u[:-13]
+                    elif u.endswith("/api/embeddings"): u = u[:-15]
+                    if u.endswith("/"): u = u[:-1]
+                    url = u
+                if data.get("model"): model = data["model"]
+    except Exception:
+        pass
+    return url, model
+
+
+async def _build_chain(
+    has_context: bool = True,
+    ai_url: str | None = None,
+    ai_model: str | None = None,
+):
+    url = ai_url
+    model = ai_model
+    if not url or not model:
+        db_url, db_model = await _get_ai_config()
+        if not url: url = db_url
+        if not model: model = db_model
+
+    llm = OllamaLLM(base_url=url, model=model, timeout=120)
+    
+    if has_context:
+        prompt = _PROMPT_TEMPLATE
+    else:
+        # Prompt super minimal untuk query non-operasional/sapaan
+        # Ini menghemat prompt-prefill token secara drastif pada CPU Ollama lambat
+        prompt = PromptTemplate.from_template("{query}")
+        
+    return prompt | llm | StrOutputParser()
 
 
 # ─── Domain Registry ─────────────────────────────────────────────────────────
@@ -168,6 +208,8 @@ class GenerateRequest(BaseModel):
     query: str
     n_results: int = 5
     use_rag: bool = True
+    ai_url: str | None = None
+    ai_model: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -209,24 +251,24 @@ async def _query_surrealdb(sql: str) -> list[dict[str, Any]]:
     return []
 
 
-async def _get_query_embedding(text: str) -> list[float]:
+async def _get_query_embedding(text: str, ai_url: str | None = None) -> list[float]:
     """Generate embedding vector untuk query teks via Ollama."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    url = ai_url
+    if not url:
+        db_url, _ = await _get_ai_config()
+        url = db_url
+    # Menggunakan timeout 5 detik agar gagal cepat jika server remote lambat/tidak punya model embedding
+    async with httpx.AsyncClient(timeout=5) as client:
         resp = await client.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
+            f"{url}/api/embeddings",
             json={"model": EMBED_MODEL, "prompt": text},
         )
         resp.raise_for_status()
         return resp.json()["embedding"]
 
 
-async def _query_surrealdb_vector(query: str, vector_table: str, n_results: int) -> list[str]:
-    """Semantic search pada SurrealDB vector index untuk satu domain."""
-    try:
-        embedding = await _get_query_embedding(query)
-    except Exception:
-        return []
-
+async def _query_surrealdb_vector(embedding: list[float], vector_table: str, n_results: int) -> list[str]:
+    """Semantic search pada SurrealDB vector index untuk satu domain menggunakan embedding query yang sudah di-generate."""
     emb_json = json.dumps(embedding)
     sql = (
         f"SELECT text, vector::similarity::cosine(embedding, {emb_json}) AS score "
@@ -242,31 +284,47 @@ async def _query_surrealdb_vector(query: str, vector_table: str, n_results: int)
 
 def _detect_intent(query: str) -> list[str]:
     """Tebak domain relevan berdasarkan keyword pada query."""
-    query_lower = query.lower()
+    query_lower = query.lower().strip()
+    
+    # Jika query sangat pendek atau sapaan umum, lewati pencarian domain agar tidak lambat
+    if len(query_lower) < 6 or query_lower in ["halo", "hi", "hey", "pagi", "siang", "sore", "malam", "test", "tes", "hello", "p", "siap", "tanya"]:
+        return []
+
     matched: list[str] = []
     for name, cfg in DOMAINS.items():
         if any(kw in query_lower for kw in cfg["keywords"]):
             matched.append(name)
-    return matched or list(DOMAINS.keys())[:3]
+    
+    # Hanya kembalikan yang cocok. Jangan paksa default ke 3 domain jika tidak ada keyword yang cocok,
+    # karena jika tidak cocok berarti ini adalah sapaan atau pertanyaan umum non-operasional.
+    return matched
 
 
 async def _build_rag_context(
-    query: str, n_results: int, target_domains: list[str]
+    query: str, n_results: int, target_domains: list[str], ai_url: str | None = None
 ) -> tuple[str, int, int]:
     """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan."""
     context_parts: list[str] = []
     vector_hits = 0
     surreal_hits = 0
 
+    # Generate query embedding sekali saja di awal untuk digunakan di semua domain
+    query_embedding = None
+    try:
+        query_embedding = await _get_query_embedding(query, ai_url=ai_url)
+    except Exception as e:
+        print(f"[WARN] Gagal mengambil embedding query: {e}")
+
     for domain in target_domains:
         cfg = DOMAINS[domain]
 
-        # Vector similarity search
-        docs = await _query_surrealdb_vector(query, cfg["vector"], n_results)
-        if docs:
-            context_parts.append(f"[Vector Search · {domain}]")
-            context_parts.extend(f"  • {doc}" for doc in docs)
-            vector_hits += len(docs)
+        # Vector similarity search (hanya jika embedding berhasil di-generate)
+        if query_embedding:
+            docs = await _query_surrealdb_vector(query_embedding, cfg["vector"], n_results)
+            if docs:
+                context_parts.append(f"[Vector Search · {domain}]")
+                context_parts.extend(f"  • {doc}" for doc in docs)
+                vector_hits += len(docs)
 
         # Structured aggregate query
         try:
@@ -396,21 +454,34 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
     source = "ollama_direct"
 
     if payload.use_rag:
-        target_domains = _detect_intent(query)
-        target_domains = [d for d in target_domains if d in DOMAINS] or list(DOMAINS.keys())[:3]
+        target_domains = [d for d in _detect_intent(query) if d in DOMAINS]
         matched_domains = target_domains
 
-        context, vector_hits, surreal_hits = await _build_rag_context(
-            query, payload.n_results, target_domains
-        )
-        if not context:
-            context = "Tidak ada data operasional yang relevan ditemukan."
-        source = "surrealdb_vector+structured+ollama"
+        if target_domains:
+            context, vector_hits, surreal_hits = await _build_rag_context(
+                query, payload.n_results, target_domains, ai_url=payload.ai_url
+            )
+            if not context:
+                context = "Tidak ada data operasional yang relevan ditemukan."
+            source = "surrealdb_vector+structured+ollama"
 
     try:
-        chain = _build_chain()
-        answer = chain.invoke({"context": context, "query": query})
+        # Jika konteks kosong, gunakan prompt minimal agar respons super cepat
+        has_real_context = bool(context and context != "(no context)" and "Tidak ada data operasional" not in context)
+        chain = await _build_chain(
+            has_context=has_real_context,
+            ai_url=payload.ai_url,
+            ai_model=payload.ai_model
+        )
+        
+        if has_real_context:
+            answer = chain.invoke({"context": context, "query": query})
+        else:
+            answer = chain.invoke({"query": query})
     except Exception as error:
+        import traceback
+        print(f"[ERROR] Gagal memanggil LLM: {error}")
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"LLM error: {error}") from error
 
     return GenerateResponse(
@@ -439,13 +510,17 @@ async def analytics_overview() -> dict[str, Any]:
         "lembur": "SELECT math::sum(overtime_hours) AS hours, math::sum(overtime_cost_idr) AS cost FROM clean_lembur_staf GROUP ALL",
     }
 
-    result: dict[str, Any] = {}
-    for key, sql in queries.items():
+    async def _run_query(k: str, q: str) -> tuple[str, Any]:
         try:
-            records = await _query_surrealdb(sql)
-            result[key] = records[0] if records else {}
+            records = await _query_surrealdb(q)
+            return k, (records[0] if records else {})
         except Exception:
-            result[key] = {}
+            return k, {}
+
+    tasks = [_run_query(k, q) for k, q in queries.items()]
+    import asyncio
+    results = await asyncio.gather(*tasks)
+    result = dict(results)
 
     capacity = result.get("okupansi", {}).get("capacity") or 0
     occupied = result.get("okupansi", {}).get("occupied") or 0

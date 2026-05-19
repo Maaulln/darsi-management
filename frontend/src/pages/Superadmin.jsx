@@ -18,11 +18,18 @@ export default function Superadmin({ refreshSidebar }) {
   const [simulatorEnabled, setSimulatorEnabled] = useState(true);
   const [simulatorLoading, setSimulatorLoading] = useState(false);
   
+  // AI Config states
+  const [aiUrl, setAiUrl] = useState('');
+  const [aiModel, setAiModel] = useState('');
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiMessage, setAiMessage] = useState('');
+  const [savedAiUrl, setSavedAiUrl] = useState('');
+  const [savedAiModel, setSavedAiModel] = useState('');
+  
   // Dynamic API states
   const [incomingApis, setIncomingApis] = useState([]);
   const [apiName, setApiName] = useState('');
   const [apiEndpoint, setApiEndpoint] = useState('');
-  const [apiMetabase, setApiMetabase] = useState('');
   const [apiError, setApiError] = useState('');
   const [apiSuccess, setApiSuccess] = useState('');
   
@@ -37,6 +44,20 @@ export default function Superadmin({ refreshSidebar }) {
       .then(r => r.json())
       .then(data => setSimulatorEnabled(data.enabled))
       .catch(err => console.error('Gagal fetch status simulator:', err));
+      
+    fetch('/api/settings/ai')
+      .then(r => r.json())
+      .then(data => {
+        if (data.url) {
+          setAiUrl(data.url);
+          setSavedAiUrl(data.url);
+        }
+        if (data.model) {
+          setAiModel(data.model);
+          setSavedAiModel(data.model);
+        }
+      })
+      .catch(err => console.error('Gagal fetch konfigurasi AI:', err));
   }, []);
 
   // Fetch incoming APIs
@@ -71,6 +92,61 @@ export default function Superadmin({ refreshSidebar }) {
       });
   };
 
+  // Handle AI Config save
+  const handleSaveAiConfig = (e) => {
+    e.preventDefault();
+    setAiLoading(true);
+    setAiMessage('');
+    fetch('/api/settings/ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: aiUrl, model: aiModel })
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'ok') {
+          setAiMessage('Konfigurasi AI berhasil disimpan. Jika URL eksternal, docker ollama lokal dimatikan.');
+          setSavedAiUrl(data.url || '');
+          setSavedAiModel(data.model || '');
+          setAiUrl(data.url || '');
+          setAiModel(data.model || '');
+        }
+        setAiLoading(false);
+      })
+      .catch(err => {
+        console.error('Gagal simpan konfigurasi AI:', err);
+        setAiMessage('Gagal menyimpan konfigurasi AI.');
+        setAiLoading(false);
+      });
+  };
+
+  // Handle AI Config reset
+  const handleResetAiConfig = () => {
+    setAiLoading(true);
+    setAiMessage('');
+    fetch('/api/settings/ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: '', model: '' })
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'ok') {
+          setAiMessage('Konfigurasi berhasil dihapus. Sistem kembali menggunakan Ollama Lokal default dan docker ollama dinyalakan.');
+          setSavedAiUrl('');
+          setSavedAiModel('');
+          setAiUrl('');
+          setAiModel('');
+        }
+        setAiLoading(false);
+      })
+      .catch(err => {
+        console.error('Gagal mereset konfigurasi AI:', err);
+        setAiMessage('Gagal menghapus konfigurasi AI.');
+        setAiLoading(false);
+      });
+  };
+
   // Handle preview example data
   const handlePreview = (domain) => {
     setPreviewLoading(true);
@@ -94,8 +170,8 @@ export default function Superadmin({ refreshSidebar }) {
     setApiError('');
     setApiSuccess('');
 
-    if (!apiName || !apiEndpoint || !apiMetabase) {
-      setApiError('Harap isi semua field formulir API Masuk.');
+    if (!apiName || !apiEndpoint) {
+      setApiError('Harap isi Nama Menu dan Endpoint/URL Data Masuk.');
       return;
     }
 
@@ -105,23 +181,37 @@ export default function Superadmin({ refreshSidebar }) {
       body: JSON.stringify({
         name: apiName,
         endpoint: apiEndpoint,
-        metabase_url: apiMetabase
+        external_url: null,
+        metabase_url: null
       })
     })
-      .then(r => r.json())
+      .then(r => {
+        if (!r.ok) {
+          return r.json().then(data => {
+            throw new Error(
+              Array.isArray(data.detail)
+                ? data.detail.map(d => `${d.loc.join('.')}: ${d.msg}`).join(', ')
+                : (data.detail || 'Gagal menyimpan integrasi.')
+            );
+          });
+        }
+        return r.json();
+      })
       .then(data => {
         if (data.status === 'ok') {
           setApiSuccess(`Sukses menambahkan integrasi API "${apiName}"!`);
           setApiName('');
           setApiEndpoint('');
-          setApiMetabase('');
           fetchIncomingApis();
           if (refreshSidebar) refreshSidebar();
         } else {
           setApiError(data.detail || 'Gagal menyimpan integrasi.');
         }
       })
-      .catch(err => setApiError(`Error: ${err}`));
+      .catch(err => {
+        console.error(err);
+        setApiError(err.message || 'Error koneksi ke server.');
+      });
   };
 
   // Delete dynamic API
@@ -186,6 +276,20 @@ export default function Superadmin({ refreshSidebar }) {
           onClick={() => setActiveTab('simulator')}
         >
           Simulator Data
+        </button>
+        <button
+          className="btn"
+          style={{
+            borderBottom: activeTab === 'ai' ? '2px solid var(--primary)' : 'none',
+            borderRadius: '0',
+            padding: '12px 16px',
+            color: activeTab === 'ai' ? 'var(--primary)' : 'var(--muted)',
+            fontWeight: activeTab === 'ai' ? '600' : 'normal',
+            background: 'none'
+          }}
+          onClick={() => setActiveTab('ai')}
+        >
+          Konfigurasi AI
         </button>
       </div>
 
@@ -253,7 +357,7 @@ export default function Superadmin({ refreshSidebar }) {
 
       {/* Tab 2: Incoming APIs */}
       {activeTab === 'incoming' && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '24px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.8fr', gap: '24px' }}>
           {/* Add Integration Form */}
           <div className="chart-card">
             <h3 style={{ fontSize: '14px', fontWeight: '600', marginBottom: '16px' }}>Tambah Integrasi Menu Dinamis</h3>
@@ -265,7 +369,7 @@ export default function Superadmin({ refreshSidebar }) {
                 </label>
                 <input
                   type="text"
-                  placeholder="Contoh: Metrik Laundry"
+                  placeholder="Contoh: Covid-19 Global"
                   value={apiName}
                   onChange={e => setApiName(e.target.value)}
                   style={{ width: '100%', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '6px', outline: 'none' }}
@@ -274,28 +378,18 @@ export default function Superadmin({ refreshSidebar }) {
 
               <div>
                 <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '6px', color: 'var(--text)' }}>
-                  Endpoint Data Masuk (Ingestion)
+                  Endpoint / URL Sumber Data
                 </label>
                 <input
                   type="text"
-                  placeholder="Contoh: /api/incoming/laundry"
+                  placeholder="e.g. https://coronavirus.m.pipedream.net/  ATAU  /api/incoming/covid"
                   value={apiEndpoint}
                   onChange={e => setApiEndpoint(e.target.value)}
                   style={{ width: '100%', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '6px', outline: 'none' }}
                 />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '6px', color: 'var(--text)' }}>
-                  Metabase Iframe / Public Embed Link
-                </label>
-                <input
-                  type="text"
-                  placeholder="http://localhost:3001/public/dashboard/..."
-                  value={apiMetabase}
-                  onChange={e => setApiMetabase(e.target.value)}
-                  style={{ width: '100%', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '6px', outline: 'none' }}
-                />
+                <span style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '4px', display: 'block' }}>
+                  Bisa berupa URL API eksternal (Auto-Pull) ATAU path lokal push webhook (e.g. /api/incoming/covid).
+                </span>
               </div>
 
               {apiError && <div className="error-box" style={{ margin: '0', padding: '10px' }}>{apiError}</div>}
@@ -308,21 +402,20 @@ export default function Superadmin({ refreshSidebar }) {
           </div>
 
           {/* Ingestion API List */}
-          <div className="chart-card">
+          <div className="chart-card" style={{ overflowX: 'auto' }}>
             <h3 style={{ fontSize: '14px', fontWeight: '600', marginBottom: '16px' }}>Daftar Integrasi API Masuk Aktif</h3>
             
             {incomingApis.length === 0 ? (
               <div className="empty-state">
                 <span>Belum ada API masuk yang terintegrasi.</span>
-                <span style={{ fontSize: '11px', color: 'var(--muted)' }}>Gunakan form di sebelah kiri untuk menambah menu dynamic Metabase baru.</span>
+                <span style={{ fontSize: '11px', color: 'var(--muted)' }}>Gunakan form di sebelah kiri untuk menambahkan menu dynamic baru.</span>
               </div>
             ) : (
               <table className="data-table">
                 <thead>
                   <tr>
                     <th>Nama Menu</th>
-                    <th>Ingress Endpoint</th>
-                    <th>Target Metabase Embed</th>
+                    <th>Metode / Sumber Data</th>
                     <th style={{ textAlign: 'center' }}>Aksi</th>
                   </tr>
                 </thead>
@@ -331,10 +424,21 @@ export default function Superadmin({ refreshSidebar }) {
                     <tr key={api.id}>
                       <td style={{ fontWeight: '600' }}>{api.name}</td>
                       <td>
-                        <span className="tag tag-teal" style={{ fontFamily: 'monospace' }}>{api.endpoint}</span>
-                      </td>
-                      <td style={{ maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '11px', color: 'var(--muted)' }}>
-                        {api.metabase_url}
+                        {api.external_url ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#10b981' }}>🔄 AUTO-PULL GET</span>
+                            <span style={{ fontSize: '10px', color: 'var(--muted)', fontFamily: 'monospace', maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {api.external_url}
+                            </span>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            <span style={{ fontSize: '11px', fontWeight: 'bold', color: 'var(--primary)' }}>📥 CLIENT-PUSH POST</span>
+                            <span style={{ fontSize: '10px', color: 'var(--muted)', fontFamily: 'monospace' }}>
+                              POST {api.endpoint}
+                            </span>
+                          </div>
+                        )}
                       </td>
                       <td style={{ textAlign: 'center' }}>
                         <button
@@ -395,6 +499,98 @@ export default function Superadmin({ refreshSidebar }) {
             <div style={{ fontSize: '12px', color: 'var(--muted)', borderTop: '1px solid var(--border)', paddingTop: '16px' }}>
               <strong>Catatan Sistem:</strong> Menonaktifkan simulator akan membekukan penambahan data baru ke tabel PostgreSQL raw_*. Namun, data yang sudah ada akan tetap utuh dan pembersihan (Refinement/Sync) tetap dapat dijalankan secara manual atau via cronjob n8n.
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tab 4: AI Configuration */}
+      {activeTab === 'ai' && (
+        <div style={{ maxWidth: '600px', margin: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          
+          {/* Active AI Config Status Card */}
+          <div className="kpi-card" style={{ borderTopColor: savedAiUrl ? '#10b981' : '#3b82f6', padding: '24px' }}>
+            <h3 style={{ fontSize: '15px', fontWeight: '700', color: 'var(--text)', marginBottom: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', background: savedAiUrl ? '#10b981' : '#3b82f6' }} />
+              Layanan AI Aktif Saat Ini
+            </h3>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div style={{ display: 'flex', borderBottom: '1px solid #f1f5f9', paddingBottom: '8px' }}>
+                <span style={{ width: '120px', fontSize: '12px', color: 'var(--muted)', fontWeight: '500' }}>Tipe Koneksi:</span>
+                <span style={{ fontSize: '12px', fontWeight: 'bold', color: savedAiUrl ? '#10b981' : '#3b82f6' }}>
+                  {savedAiUrl ? '🔄 Eksternal (API Remote)' : '🏠 Lokal (Default Ollama Internal)'}
+                </span>
+              </div>
+              
+              <div style={{ display: 'flex', borderBottom: '1px solid #f1f5f9', paddingBottom: '8px' }}>
+                <span style={{ width: '120px', fontSize: '12px', color: 'var(--muted)', fontWeight: '500' }}>Host / Endpoint:</span>
+                <span style={{ fontSize: '12px', fontFamily: 'monospace', color: 'var(--text)' }}>
+                  {savedAiUrl || 'http://ollama:11434'}
+                </span>
+              </div>
+              
+              <div style={{ display: 'flex', paddingBottom: '4px' }}>
+                <span style={{ width: '120px', fontSize: '12px', color: 'var(--muted)', fontWeight: '500' }}>Model Aktif:</span>
+                <span style={{ fontSize: '12px', fontWeight: '600', color: 'var(--text)' }}>
+                  {savedAiModel || 'qwen3.5:2b'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="chart-card">
+            <h3 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '8px' }}>Atur Konfigurasi AI Baru</h3>
+            <p style={{ color: 'var(--muted)', fontSize: '12px', marginBottom: '20px' }}>
+              Ganti endpoint Ollama lokal dengan API eksternal (contoh: medlama2 via Cloudflare tunnel). Kosongkan URL untuk kembali menggunakan default lokal.
+            </p>
+            
+            <form onSubmit={handleSaveAiConfig} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '6px', color: 'var(--text)' }}>
+                  AI API URL
+                </label>
+                <input
+                  type="text"
+                  placeholder="Contoh: https://auburn-absence-channels-accounting.trycloudflare.com"
+                  value={aiUrl}
+                  onChange={e => setAiUrl(e.target.value)}
+                  style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--border)', borderRadius: '6px', outline: 'none' }}
+                />
+                <span style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '4px', display: 'block' }}>
+                  Kosongkan untuk menggunakan default internal (http://ollama:11434).
+                </span>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '6px', color: 'var(--text)' }}>
+                  Model AI
+                </label>
+                <input
+                  type="text"
+                  placeholder="Contoh: qwen3.5:2b atau medlama2"
+                  value={aiModel}
+                  onChange={e => setAiModel(e.target.value)}
+                  style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--border)', borderRadius: '6px', outline: 'none' }}
+                />
+              </div>
+
+              {aiMessage && (
+                <div style={{ color: aiMessage.includes('Gagal') ? '#ef4444' : '#059669', background: aiMessage.includes('Gagal') ? '#fef2f2' : '#ecfdf5', padding: '10px', borderRadius: '6px', fontSize: '12px', border: `1px solid ${aiMessage.includes('Gagal') ? '#fecaca' : '#a7f3d0'}` }}>
+                  {aiMessage}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: '10px', marginTop: '4px' }}>
+                <button type="submit" className="chat-send" style={{ flex: 2, margin: '0', display: 'flex', justifyContent: 'center' }} disabled={aiLoading}>
+                  {aiLoading ? <div className="spinner" style={{ width: '16px', height: '16px' }} /> : 'Simpan Konfigurasi'}
+                </button>
+                {savedAiUrl && (
+                  <button type="button" className="btn" onClick={handleResetAiConfig} style={{ flex: 1, borderColor: '#ef4444', color: '#ef4444', background: '#fff', fontSize: '13px', padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0' }} disabled={aiLoading}>
+                    Hapus
+                  </button>
+                )}
+              </div>
+            </form>
           </div>
         </div>
       )}

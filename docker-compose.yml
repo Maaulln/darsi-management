@@ -104,7 +104,7 @@ services:
     working_dir: /app
     command: >
       bash -c "
-        pip install --no-cache-dir pandas==2.2.3 sqlalchemy==2.0.41 psycopg2-binary==2.9.10 &&
+        pip install --default-timeout=1000 --no-cache-dir pandas==2.2.3 sqlalchemy==2.0.41 psycopg2-binary==2.9.10 &&
         python simrs_simulator.py
       "
     depends_on:

@@ -13,12 +13,24 @@ export default function Chat() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [useRag, setUseRag] = useState(true);
+  const [activeModel, setActiveModel] = useState('Memuat...');
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    fetch('/api/settings/ai')
+      .then(r => r.json())
+      .then(data => {
+        setActiveModel(data.model || 'qwen3.5:2b (Lokal)');
+      })
+      .catch(() => {
+        setActiveModel('qwen3.5:2b (Lokal)');
+      });
+  }, []);
 
   const handleSend = async (text = input) => {
     const msg = text.trim();
@@ -81,6 +93,9 @@ export default function Chat() {
           />
           RAG (konteks data operasional)
         </label>
+        <span style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--muted)', background: '#f1f5f9', padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--border)' }}>
+          Model: <strong>{activeModel}</strong>
+        </span>
         <span style={{ flex: 1 }} />
         {messages.length > 0 && (
           <button
