@@ -7,6 +7,7 @@ import Summary from './pages/Summary';
 import MetabasePage from './pages/MetabasePage';
 import StatusPage from './pages/StatusPage';
 import Superadmin from './pages/Superadmin';
+import DynamicVisualizer from './pages/DynamicVisualizer';
 
 const NAV = [
   {
@@ -154,17 +155,7 @@ export default function App() {
             <Route path="/metabase" element={<MetabasePage />} />
             <Route path="/status" element={<StatusPage />} />
             <Route path="/superadmin" element={<Superadmin refreshSidebar={loadDynamicNavs} />} />
-            {dynamicNavs.map(api => (
-              <Route
-                key={api.path}
-                path={api.path}
-                element={
-                  <div className="metabase-wrap" style={{ height: '100%' }}>
-                    <iframe src={api.metabase_url} title={api.label} />
-                  </div>
-                }
-              />
-            ))}
+            <Route path="/dynamic-api/:id" element={<DynamicVisualizer />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>

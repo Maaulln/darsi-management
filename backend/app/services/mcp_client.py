@@ -9,6 +9,22 @@ import httpx
 from app.core.config import settings
 
 
+def _get_db_ai_config() -> tuple[str, str]:
+    try:
+        from sqlalchemy import text
+        from app.services.postgres import engine
+        with engine.connect() as conn:
+            url = conn.execute(
+                text("SELECT value FROM darsi_settings WHERE key = 'ai_url'")
+            ).scalar()
+            model = conn.execute(
+                text("SELECT value FROM darsi_settings WHERE key = 'ai_model'")
+            ).scalar()
+            return url or "", model or ""
+    except Exception:
+        return "", ""
+
+
 class MCPClient:
     """Klien untuk semua endpoint MCP Server."""
 
@@ -100,10 +116,13 @@ class MCPClient:
         use_rag: bool = True,
     ) -> dict[str, Any]:
         """RAG retrieval + LLM generation via MCP server (LangChain + Ollama)."""
+        url, model = _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
             "use_rag": use_rag,
+            "ai_url": url,
+            "ai_model": model,
         }
         try:
             resp = httpx.post(

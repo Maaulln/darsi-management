@@ -30,8 +30,8 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM = 768  # nomic-embed-text output dimension
 
-RECORD_LIMIT = 100   # max records per domain
-BATCH_SIZE = 50      # records per SurrealDB bulk insert
+RECORD_LIMIT = 40   # max records per domain
+BATCH_SIZE = 40      # records per SurrealDB bulk insert
 
 DOMAINS = [
     "pasien_aktif",
@@ -92,9 +92,29 @@ def surreal_exec(sql: str) -> None:
 
 # ─── Ollama embedding ─────────────────────────────────────────────────────────
 
+_cached_ollama_url = None
+
+def _get_dynamic_ollama_url() -> str:
+    global _cached_ollama_url
+    if _cached_ollama_url is not None:
+        return _cached_ollama_url
+
+    try:
+        r = requests.get("http://backend:8000/api/settings/ai", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("url"):
+                _cached_ollama_url = data["url"]
+                return _cached_ollama_url
+    except Exception:
+        pass
+    _cached_ollama_url = OLLAMA_BASE_URL
+    return _cached_ollama_url
+
 def get_embedding(text: str) -> list[float]:
+    url = _get_dynamic_ollama_url()
     resp = ollama_session.post(
-        f"{OLLAMA_BASE_URL}/api/embeddings",
+        f"{url}/api/embeddings",
         json={"model": EMBED_MODEL, "prompt": text},
         timeout=30,
     )
@@ -193,8 +213,8 @@ def embed_domain(domain: str) -> int:
         except Exception as exc:
             print(f"   [WARN] {domain} baris {idx}: embedding gagal — {exc}")
 
-    # Fetch embeddings in parallel using up to 16 threads
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    # Fetch embeddings in parallel using up to 4 threads
+    with ThreadPoolExecutor(max_workers=4) as executor:
         executor.map(_fetch_one, range(len(records)))
 
     count = 0
