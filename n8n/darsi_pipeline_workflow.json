@@ -31,7 +31,7 @@
         "method": "POST",
         "url": "http://pipeline-service:8200/pipeline/refine",
         "options": {
-          "timeout": 120000,
+          "timeout": 300000,
           "response": {
             "response": {
               "responseFormat": "json"
@@ -51,7 +51,7 @@
         "method": "POST",
         "url": "http://pipeline-service:8200/pipeline/sync",
         "options": {
-          "timeout": 120000,
+          "timeout": 300000,
           "response": {
             "response": {
               "responseFormat": "json"
@@ -71,7 +71,7 @@
         "method": "POST",
         "url": "http://pipeline-service:8200/pipeline/embed",
         "options": {
-          "timeout": 120000,
+          "timeout": 300000,
           "response": {
             "response": {
               "responseFormat": "json"

@@ -2,21 +2,15 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import random
-import os
-from sqlalchemy import create_engine
-
-# Konfigurasi Database
-DB_URL = f"postgresql://{os.getenv('POSTGRES_USER', 'darsi_user')}:{os.getenv('POSTGRES_PASSWORD', 'darsi_password')}@{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'darsi')}"
 
 UNITS = ['UGD', 'RI-A', 'RI-B', 'OK', 'LAB', 'RAD', 'FAR', 'ICU']
 BUILDINGS = ['GD-A', 'GD-B']
 CLASSES = ['VIP', 'Kls1', 'Kls2', 'Kls3']
 
 def generate_bulk_data(num_records=150):
-    engine = create_engine(DB_URL)
     now = datetime.now()
-    
-    print(f"Generating {num_records} records per domain...")
+
+    print(f"Generating {num_records} records per domain (DB insert disabled)...")
 
     # 1. Pasien Aktif
     data_pasien = []
@@ -35,8 +29,9 @@ def generate_bulk_data(num_records=150):
             'diagnosis_code': f'ICD10-{random.randint(100, 999)}',
             'created_at': now
         })
-    pd.DataFrame(data_pasien).to_sql('raw_pasien_aktif', engine, if_exists='append', index=False)
-    print(" - raw_pasien_aktif: Done")
+    df_pasien = pd.DataFrame(data_pasien)
+    # df_pasien.to_sql('raw_pasien_aktif', engine, if_exists='append', index=False)
+    print(f" - raw_pasien_aktif: {len(df_pasien)} rows generated (not inserted)")
 
     # 2. Okupansi Kamar
     data_okupansi = []
@@ -56,8 +51,9 @@ def generate_bulk_data(num_records=150):
             'room_status': 'Aktif',
             'created_at': now
         })
-    pd.DataFrame(data_okupansi).to_sql('raw_okupansi_kamar', engine, if_exists='append', index=False)
-    print(" - raw_okupansi_kamar: Done")
+    df_okupansi = pd.DataFrame(data_okupansi)
+    # df_okupansi.to_sql('raw_okupansi_kamar', engine, if_exists='append', index=False)
+    print(f" - raw_okupansi_kamar: {len(df_okupansi)} rows generated (not inserted)")
 
     # 3. Meter Listrik
     data_listrik = []
@@ -75,8 +71,9 @@ def generate_bulk_data(num_records=150):
             'power_factor': random.uniform(0.8, 0.95),
             'created_at': now
         })
-    pd.DataFrame(data_listrik).to_sql('raw_meter_listrik', engine, if_exists='append', index=False)
-    print(" - raw_meter_listrik: Done")
+    df_listrik = pd.DataFrame(data_listrik)
+    # df_listrik.to_sql('raw_meter_listrik', engine, if_exists='append', index=False)
+    print(f" - raw_meter_listrik: {len(df_listrik)} rows generated (not inserted)")
 
     # 4. Konsumsi Air
     data_air = []
@@ -91,8 +88,9 @@ def generate_bulk_data(num_records=150):
             'pressure_avg': random.uniform(2.0, 4.5),
             'created_at': now
         })
-    pd.DataFrame(data_air).to_sql('raw_konsumsi_air', engine, if_exists='append', index=False)
-    print(" - raw_konsumsi_air: Done")
+    df_air = pd.DataFrame(data_air)
+    # df_air.to_sql('raw_konsumsi_air', engine, if_exists='append', index=False)
+    print(f" - raw_konsumsi_air: {len(df_air)} rows generated (not inserted)")
 
     # 5. Biaya Operasional
     data_biaya = []
@@ -107,8 +105,9 @@ def generate_bulk_data(num_records=150):
             'budget_idr': random.uniform(50_000_000, 600_000_000),
             'created_at': now
         })
-    pd.DataFrame(data_biaya).to_sql('raw_biaya_operasional_unit', engine, if_exists='append', index=False)
-    print(" - raw_biaya_operasional_unit: Done")
+    df_biaya = pd.DataFrame(data_biaya)
+    # df_biaya.to_sql('raw_biaya_operasional_unit', engine, if_exists='append', index=False)
+    print(f" - raw_biaya_operasional_unit: {len(df_biaya)} rows generated (not inserted)")
 
     # 6. Konsumsi Obat/Alkes
     data_obat = []
@@ -125,13 +124,13 @@ def generate_bulk_data(num_records=150):
             'quantity': random.uniform(1, 100),
             'uom': random.choice(['Botol', 'Pcs', 'Box']),
             'unit_cost_idr': random.uniform(5000, 100000),
-            'total_cost_idr': 0, # Placeholder
+            'total_cost_idr': 0,
             'created_at': now
         })
     df_obat = pd.DataFrame(data_obat)
     df_obat['total_cost_idr'] = df_obat['quantity'] * df_obat['unit_cost_idr']
-    df_obat.to_sql('raw_konsumsi_obat_alkes', engine, if_exists='append', index=False)
-    print(" - raw_konsumsi_obat_alkes: Done")
+    # df_obat.to_sql('raw_konsumsi_obat_alkes', engine, if_exists='append', index=False)
+    print(f" - raw_konsumsi_obat_alkes: {len(df_obat)} rows generated (not inserted)")
 
     # 7. Lembur Staf
     data_lembur = []
@@ -148,8 +147,9 @@ def generate_bulk_data(num_records=150):
             'reason': 'Overload pasien',
             'created_at': now
         })
-    pd.DataFrame(data_lembur).to_sql('raw_lembur_staf', engine, if_exists='append', index=False)
-    print(" - raw_lembur_staf: Done")
+    df_lembur = pd.DataFrame(data_lembur)
+    # df_lembur.to_sql('raw_lembur_staf', engine, if_exists='append', index=False)
+    print(f" - raw_lembur_staf: {len(df_lembur)} rows generated (not inserted)")
 
     # 8. Jadwal Alat Berat
     data_alat = []
@@ -166,8 +166,9 @@ def generate_bulk_data(num_records=150):
             'status': random.choice(['Scheduled', 'Completed', 'Ongoing']),
             'created_at': now
         })
-    pd.DataFrame(data_alat).to_sql('raw_jadwal_alat_berat', engine, if_exists='append', index=False)
-    print(" - raw_jadwal_alat_berat: Done")
+    df_alat = pd.DataFrame(data_alat)
+    # df_alat.to_sql('raw_jadwal_alat_berat', engine, if_exists='append', index=False)
+    print(f" - raw_jadwal_alat_berat: {len(df_alat)} rows generated (not inserted)")
 
-if __name__ == "__main__":
-    generate_bulk_data(150)
+# if __name__ == "__main__":
+#     generate_bulk_data(150)
