@@ -9,6 +9,22 @@ import httpx
 from app.core.config import settings
 
 
+def _get_db_ai_config() -> tuple[str, str]:
+    try:
+        from sqlalchemy import text
+        from app.services.postgres import engine
+        with engine.connect() as conn:
+            url = conn.execute(
+                text("SELECT value FROM darsi_settings WHERE key = 'ai_url'")
+            ).scalar()
+            model = conn.execute(
+                text("SELECT value FROM darsi_settings WHERE key = 'ai_model'")
+            ).scalar()
+            return url or "", model or ""
+    except Exception:
+        return "", ""
+
+
 class MCPClient:
     """Klien untuk semua endpoint MCP Server."""
 
@@ -100,10 +116,13 @@ class MCPClient:
         use_rag: bool = True,
     ) -> dict[str, Any]:
         """RAG retrieval + LLM generation via MCP server (LangChain + Ollama)."""
+        url, model = _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
             "use_rag": use_rag,
+            "ai_url": url,
+            "ai_model": model,
         }
         try:
             resp = httpx.post(
@@ -123,6 +142,29 @@ class MCPClient:
                 "surreal_hits": 0,
                 "matched_domains": [],
             }
+
+    async def generate_stream(
+        self,
+        query: str,
+        n_results: int = 5,
+        use_rag: bool = True,
+    ):
+        """RAG + LLM streaming via MCP server — yield token chunks secara async."""
+        url, model = _get_db_ai_config()
+        payload: dict[str, Any] = {
+            "query": query,
+            "n_results": n_results,
+            "use_rag": use_rag,
+            "ai_url": url,
+            "ai_model": model,
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream(
+                "POST", f"{self.base_url}/mcp/generate/stream", json=payload
+            ) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_text():
+                    yield chunk
 
     # ── Analytics ─────────────────────────────────────────────────────────────
 

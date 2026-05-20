@@ -11,6 +11,7 @@ Tahapan refinement per domain:
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -104,6 +105,53 @@ def build_postgres_url() -> str:
 
 def create_engine_from_env() -> Engine:
     return create_engine(build_postgres_url(), pool_pre_ping=True)
+
+
+def fast_write_df(df: pd.DataFrame, table_name: str, engine: Engine) -> None:
+    """Tulis DataFrame ke PostgreSQL menggunakan COPY (jauh lebih cepat dari to_sql).
+
+    Strategi:
+        - Jika tabel belum ada, buat dengan to_sql (satu kali, lambat).
+        - Jika sudah ada, TRUNCATE lalu stream data via COPY FROM stdin CSV.
+
+    Args:
+        df: DataFrame yang sudah dibersihkan.
+        table_name: Nama tabel target di PostgreSQL.
+        engine: SQLAlchemy engine.
+    """
+
+    # Pastikan semua nilai NaT/NaN menjadi None agar CSV-safe
+    df = df.where(pd.notna(df), None)
+
+    with engine.connect() as conn:
+        raw_conn = conn.connection
+        with raw_conn.cursor() as cur:
+            # Cek apakah tabel sudah ada
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = %s)",
+                (table_name,),
+            )
+            table_exists = cur.fetchone()[0]
+
+            if not table_exists:
+                # Buat tabel dengan struktur DataFrame (hanya sekali)
+                df.head(0).to_sql(table_name, engine, if_exists="fail", index=False)
+
+            # Kosongkan tabel tanpa DROP (lebih cepat, pertahankan struktur)
+            cur.execute(f"TRUNCATE TABLE {table_name}")
+
+            # Stream data via COPY FROM stdin (format CSV)
+            buf = io.StringIO()
+            df.to_csv(buf, index=False, header=False, na_rep="")
+            buf.seek(0)
+
+            columns = ", ".join(f'"{c}"' for c in df.columns)
+            cur.copy_expert(
+                f"COPY {table_name} ({columns}) FROM STDIN WITH (FORMAT CSV, NULL '')",
+                buf,
+            )
+        raw_conn.commit()
 
 
 def trim_strings(df: pd.DataFrame) -> pd.DataFrame:
@@ -206,7 +254,7 @@ def refine_domain(engine: Engine, domain: str, config: dict[str, Any]) -> Refine
     df = df.replace({np.nan: None})
 
     try:
-        df.to_sql(refined_table, engine, if_exists="replace", index=False)
+        fast_write_df(df, refined_table, engine)
     except Exception as error:
         report.errors.append(f"write_refined_failed: {error}")
         return report

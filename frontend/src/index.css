@@ -400,6 +400,8 @@ button { font-family: inherit; }
   0%, 60%, 100% { opacity: 0.3; transform: scale(1); }
   30% { opacity: 1; transform: scale(1.2); }
 }
+.streaming-cursor { display: inline-block; animation: blink 0.8s step-end infinite; margin-left: 1px; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 .chat-input-area {
   padding: 16px;

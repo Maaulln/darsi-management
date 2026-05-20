@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.services.mcp_client import mcp_client
 from app.services.rag_service import direct_query, rag_query
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -43,3 +45,25 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         context_used=result.get("context_used", ""),
         matched_domains=result.get("matched_domains", []),
     )
+
+
+@router.post("/stream")
+async def chat_stream(payload: ChatRequest) -> StreamingResponse:
+    """Chat dengan token streaming — token dikirim saat LLM menghasilkannya.
+
+    Mengembalikan text/plain chunked response. Frontend membaca dengan ReadableStream.
+    """
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Pesan tidak boleh kosong.")
+
+    async def token_generator():
+        try:
+            async for chunk in mcp_client.generate_stream(
+                text, use_rag=payload.use_rag
+            ):
+                yield chunk
+        except Exception as error:
+            yield f"[Error: {error}]"
+
+    return StreamingResponse(token_generator(), media_type="text/plain")

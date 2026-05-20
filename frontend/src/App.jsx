@@ -6,6 +6,8 @@ import Chat from './pages/Chat';
 import Summary from './pages/Summary';
 import MetabasePage from './pages/MetabasePage';
 import StatusPage from './pages/StatusPage';
+import Superadmin from './pages/Superadmin';
+import DynamicVisualizer from './pages/DynamicVisualizer';
 
 const NAV = [
   {
@@ -40,7 +42,29 @@ const NAV = [
 export default function App() {
   const [sysStatus, setSysStatus] = useState('checking');
   const [clock, setClock] = useState('');
+  const [dynamicNavs, setDynamicNavs] = useState([]);
   const location = useLocation();
+
+  const loadDynamicNavs = () => {
+    fetch('/api/settings/incoming-apis')
+      .then(r => r.json())
+      .then(data => {
+        if (data.apis) {
+          setDynamicNavs(data.apis.map(api => ({
+            path: `/dynamic-api/${api.id}`,
+            label: api.name,
+            metabase_url: api.metabase_url,
+            d: 'M2 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1H3a1 1 0 01-1-1V4zM8 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1H9a1 1 0 01-1-1V4zM15 3a1 1 0 00-1 1v12a1 1 0 001 1h2a1 1 0 001-1V4a1 1 0 00-1-1h-2z',
+            isDynamic: true
+          })));
+        }
+      })
+      .catch(err => console.error("Gagal load API dinamis:", err));
+  };
+
+  useEffect(() => {
+    loadDynamicNavs();
+  }, []);
 
   useEffect(() => {
     const tick = () =>
@@ -60,11 +84,21 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  const currentNav = NAV.find(n =>
-    n.exact ? location.pathname === n.path : location.pathname.startsWith(n.path) && n.path !== '/'
-  ) ?? NAV[0];
+  const allNavs = [
+    ...NAV,
+    ...dynamicNavs,
+    {
+      path: '/superadmin', label: 'Superadmin',
+      d: 'M9.243 3.03a1 1 0 01.727.293l2.4 2.4a1 1 0 01.293.727v2.4a1 1 0 01-.293.727l-2.4 2.4a1 1 0 01-.727.293H6.843a1 1 0 01-.727-.293l-2.4-2.4A1 1 0 013.42 6.86V4.46a1 1 0 01.293-.727l2.4-2.4a1 1 0 01.727-.293h2.4z',
+      fr: true
+    }
+  ];
 
-  const noPad = ['/chat', '/metabase'].includes(location.pathname);
+  const currentNav = allNavs.find(n =>
+    n.exact ? location.pathname === n.path : location.pathname.startsWith(n.path) && n.path !== '/'
+  ) ?? allNavs[0];
+
+  const noPad = ['/chat', '/metabase'].includes(location.pathname) || location.pathname.startsWith('/dynamic-api');
 
   return (
     <div className="layout">
@@ -78,7 +112,7 @@ export default function App() {
         </div>
 
         <nav className="nav">
-          {NAV.map(item => (
+          {allNavs.map(item => (
             <NavLink
               key={item.path}
               to={item.path}
@@ -120,6 +154,8 @@ export default function App() {
             <Route path="/summary" element={<Summary />} />
             <Route path="/metabase" element={<MetabasePage />} />
             <Route path="/status" element={<StatusPage />} />
+            <Route path="/superadmin" element={<Superadmin refreshSidebar={loadDynamicNavs} />} />
+            <Route path="/dynamic-api/:id" element={<DynamicVisualizer />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>
