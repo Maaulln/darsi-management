@@ -143,6 +143,29 @@ class MCPClient:
                 "matched_domains": [],
             }
 
+    async def generate_stream(
+        self,
+        query: str,
+        n_results: int = 5,
+        use_rag: bool = True,
+    ):
+        """RAG + LLM streaming via MCP server — yield token chunks secara async."""
+        url, model = _get_db_ai_config()
+        payload: dict[str, Any] = {
+            "query": query,
+            "n_results": n_results,
+            "use_rag": use_rag,
+            "ai_url": url,
+            "ai_model": model,
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream(
+                "POST", f"{self.base_url}/mcp/generate/stream", json=payload
+            ) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_text():
+                    yield chunk
+
     # ── Analytics ─────────────────────────────────────────────────────────────
 
     def fetch_analytics(self, endpoint: str) -> dict[str, Any]:

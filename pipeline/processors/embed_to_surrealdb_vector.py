@@ -185,11 +185,19 @@ def row_to_text(domain: str, row: dict) -> str:
 def setup_vector_table(domain: str) -> None:
     table = f"vector_darsi_{domain}"
     sql = (
+        # Analyzer shared — didefinisikan sekali, IF NOT EXISTS idempotent
+        "DEFINE ANALYZER IF NOT EXISTS darsi_analyzer "
+        "TOKENIZERS blank FILTERS lowercase,ascii; "
         f"DEFINE TABLE IF NOT EXISTS {table} SCHEMALESS; "
         f"DELETE {table}; "
+        # HNSW index untuk cosine similarity (vector search)
         f"DEFINE INDEX IF NOT EXISTS idx_hnsw_{domain} "
         f"ON TABLE {table} FIELDS embedding "
-        f"HNSW DIMENSION {EMBED_DIM} DIST COSINE;"
+        f"HNSW DIMENSION {EMBED_DIM} DIST COSINE; "
+        # BM25 full-text search index pada field text
+        f"DEFINE INDEX IF NOT EXISTS idx_ft_{domain} "
+        f"ON TABLE {table} FIELDS text "
+        f"SEARCH ANALYZER darsi_analyzer BM25;"
     )
     surreal_exec(sql)
 
