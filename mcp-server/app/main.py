@@ -19,18 +19,31 @@ Endpoint:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
+import time
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import OllamaLLM
 from pydantic import BaseModel
+from sentence_transformers import CrossEncoder
 
 app = FastAPI(title="DARSI MCP Server")
+
+
+@app.on_event("startup")
+async def _preload_cross_encoder() -> None:
+    """Pre-load cross-encoder saat startup agar request pertama tidak kena cold-start."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _get_cross_encoder)
+    print(f"[INFO] Cross-encoder loaded: {_CROSS_ENCODER_MODEL}")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -45,21 +58,104 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:2b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM = 768
 
+# ─── TTL Cache ────────────────────────────────────────────────────────────────
+# Key → (value, timestamp). Digunakan untuk aggregate SurrealDB, embedding query,
+# dan AI config agar tidak dipanggil ulang setiap request.
+
+_CACHE: dict[str, tuple[Any, float]] = {}
+_TTL_AGGREGATE = 60.0   # detik — sinkron dengan interval n8n pipeline
+_TTL_EMBEDDING = 300.0  # 5 menit — query sama sering diulang user
+_TTL_AI_CONFIG = 30.0   # 30 detik — setting jarang berubah
+
+
+def _cache_get(key: str, ttl: float) -> Any | None:
+    entry = _CACHE.get(key)
+    if entry and (time.monotonic() - entry[1]) < ttl:
+        return entry[0]
+    _CACHE.pop(key, None)
+    return None
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _CACHE[key] = (value, time.monotonic())
+
+
+# ─── LLM Singleton Pool ───────────────────────────────────────────────────────
+# OllamaLLM diinstansiasi sekali per (url, model) dan di-reuse antar request.
+
+_LLM_POOL: dict[tuple[str, str], OllamaLLM] = {}
+
+
+def _get_llm(url: str, model: str) -> OllamaLLM:
+    key = (url, model)
+    if key not in _LLM_POOL:
+        _LLM_POOL[key] = OllamaLLM(base_url=url, model=model, timeout=120)
+    return _LLM_POOL[key]
+
+
+# ─── Cross-Encoder Singleton ──────────────────────────────────────────────────
+# Model ringan (~22MB) untuk re-ranking kandidat dokumen setelah RRF.
+# ms-marco-MiniLM-L-6-v2: fast CPU inference, ~50-150ms untuk 15 dokumen.
+
+_CROSS_ENCODER_MODEL = os.getenv(
+    "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+_CROSS_ENCODER: CrossEncoder | None = None
+
+
+def _get_cross_encoder() -> CrossEncoder:
+    global _CROSS_ENCODER
+    if _CROSS_ENCODER is None:
+        _CROSS_ENCODER = CrossEncoder(_CROSS_ENCODER_MODEL)
+    return _CROSS_ENCODER
+
+
+async def _rerank_async(query: str, docs: list[str], top_k: int) -> list[str]:
+    """Re-rank dokumen kandidat dengan cross-encoder secara non-blocking.
+
+    Cross-encoder membaca pasangan (query, doc) dan memberi skor relevansi
+    yang jauh lebih akurat dibanding cosine similarity embedding.
+    Dijalankan di thread pool agar tidak memblokir event loop.
+    """
+    if not docs or len(docs) <= top_k:
+        return docs
+    ce = _get_cross_encoder()
+    pairs = [(query, doc) for doc in docs]
+    loop = asyncio.get_event_loop()
+    scores = await loop.run_in_executor(None, ce.predict, pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_k]]
+
 # ─── LangChain Chain ─────────────────────────────────────────────────────────
 
+# Chain-of-Thought prompt: arahkan LLM untuk mengidentifikasi data dulu,
+# baru analisis, baru jawab — meningkatkan akurasi signifikan pada model kecil (2B).
 _PROMPT_TEMPLATE = PromptTemplate.from_template(
-    "Anda adalah asisten analitik operasional rumah sakit DARSI Surabaya.\n"
-    "Gunakan KONTEKS DATA OPERASIONAL berikut untuk menjawab pertanyaan dengan ringkas,\n"
-    "akurat, dan dalam Bahasa Indonesia. Jika data tidak cukup, jelaskan terbatas pada\n"
-    "fakta yang tersedia dan sarankan data tambahan yang dibutuhkan.\n\n"
+    "Anda adalah asisten analitik operasional rumah sakit DARSI Surabaya.\n\n"
     "KONTEKS DATA OPERASIONAL:\n"
     "{context}\n\n"
     "PERTANYAAN: {query}\n\n"
+    "Jawab dengan urutan berikut:\n"
+    "1. Data relevan: sebutkan angka atau fakta kunci dari konteks\n"
+    "2. Analisis: interpretasikan angka tersebut\n"
+    "3. Jawaban: berikan kesimpulan ringkas dalam Bahasa Indonesia\n"
+    "Jika data tidak cukup, sebutkan apa yang tersedia dan data apa yang kurang.\n\n"
     "JAWABAN:"
+)
+
+# Prompt ringkas untuk HyDE — generate jawaban hipotetis singkat
+# agar embedding-nya lebih mendekati dokumen di vector store daripada embedding query mentah.
+_HYDE_PROMPT = PromptTemplate.from_template(
+    "Buat satu kalimat singkat dalam Bahasa Indonesia yang merupakan contoh data "
+    "operasional rumah sakit yang relevan dengan pertanyaan berikut:\n\n"
+    "Pertanyaan: {query}\n\nContoh data:"
 )
 
 
 async def _get_ai_config() -> tuple[str, str]:
+    cached = _cache_get("ai_config", _TTL_AI_CONFIG)
+    if cached is not None:
+        return cached
     url = OLLAMA_BASE_URL
     model = OLLAMA_MODEL
     try:
@@ -77,7 +173,9 @@ async def _get_ai_config() -> tuple[str, str]:
                 if data.get("model"): model = data["model"]
     except Exception:
         pass
-    return url, model
+    result = (url, model)
+    _cache_set("ai_config", result)
+    return result
 
 
 async def _build_chain(
@@ -92,15 +190,15 @@ async def _build_chain(
         if not url: url = db_url
         if not model: model = db_model
 
-    llm = OllamaLLM(base_url=url, model=model, timeout=120)
-    
+    llm = _get_llm(url, model)
+
     if has_context:
         prompt = _PROMPT_TEMPLATE
     else:
         # Prompt super minimal untuk query non-operasional/sapaan
-        # Ini menghemat prompt-prefill token secara drastif pada CPU Ollama lambat
+        # Ini menghemat prompt-prefill token secara drastis pada CPU Ollama lambat
         prompt = PromptTemplate.from_template("{query}")
-        
+
     return prompt | llm | StrOutputParser()
 
 
@@ -282,6 +380,74 @@ async def _query_surrealdb_vector(embedding: list[float], vector_table: str, n_r
         return []
 
 
+# Stopword Indonesia ringan untuk keyword extraction BM25
+_ID_STOPWORDS = {
+    "dan", "di", "ke", "dari", "yang", "ini", "itu", "dengan", "untuk",
+    "adalah", "ada", "pada", "dalam", "berapa", "bagaimana", "apa", "mana",
+    "bisa", "apakah", "tolong", "mohon", "tampilkan", "lihat", "tunjukkan",
+}
+
+
+def _extract_keywords(text: str) -> str:
+    """Ekstrak kata kunci dari query untuk BM25 full-text search.
+
+    Filter stopword Indonesia dan karakter non-alfanumerik, ambil max 8 kata.
+    """
+    words = re.findall(r"\b\w+\b", text.lower())
+    keywords = [w for w in words if w not in _ID_STOPWORDS and len(w) > 2]
+    return " ".join(keywords[:8])
+
+
+def _expand_keywords(keywords: str, target_domains: list[str]) -> str:
+    """Perkaya keyword BM25 dengan sinonim dari domain registry.
+
+    Domain registry sudah berisi keyword operasional yang relevan per domain
+    (misal: 'biaya' → ['biaya', 'cost', 'budget', 'anggaran', 'pengeluaran']).
+    Penggabungan ini meningkatkan recall BM25 tanpa memanggil LLM tambahan.
+    """
+    base = set(keywords.split())
+    for domain in target_domains[:3]:  # max 3 domain agar keyword tidak terlalu panjang
+        base.update(DOMAINS[domain]["keywords"][:3])
+    return " ".join(list(base)[:12])
+
+
+async def _query_surrealdb_bm25(keywords: str, vector_table: str, n_results: int) -> list[str]:
+    """BM25 full-text search pada vector table menggunakan SurrealDB SEARCH index."""
+    if not keywords.strip():
+        return []
+    # Escape single quote agar aman dimasukkan ke SQL string
+    safe_kw = keywords.replace("'", "\\'")
+    sql = (
+        f"SELECT text, search::score(1) AS bm25_score "
+        f"FROM {vector_table} "
+        f"WHERE text @1@ '{safe_kw}' "
+        f"ORDER BY bm25_score DESC LIMIT {n_results};"
+    )
+    try:
+        records = await _query_surrealdb(sql)
+        return [r["text"] for r in records if "text" in r]
+    except Exception:
+        return []
+
+
+def _rrf(
+    vector_docs: list[str],
+    bm25_docs: list[str],
+    k: int = 60,
+) -> list[str]:
+    """Reciprocal Rank Fusion — gabungkan ranking cosine dan BM25.
+
+    Dokumen yang muncul di kedua daftar mendapat skor lebih tinggi.
+    Formula: score(d) = Σ 1/(k + rank(d)) untuk setiap ranking list.
+    """
+    scores: dict[str, float] = {}
+    for rank, doc in enumerate(vector_docs):
+        scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank + 1)
+    for rank, doc in enumerate(bm25_docs):
+        scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=lambda d: scores[d], reverse=True)
+
+
 def _detect_intent(query: str) -> list[str]:
     """Tebak domain relevan berdasarkan keyword pada query."""
     query_lower = query.lower().strip()
@@ -300,44 +466,134 @@ def _detect_intent(query: str) -> list[str]:
     return matched
 
 
-async def _build_rag_context(
-    query: str, n_results: int, target_domains: list[str], ai_url: str | None = None
-) -> tuple[str, int, int]:
-    """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan."""
-    context_parts: list[str] = []
-    vector_hits = 0
-    surreal_hits = 0
+async def _generate_hypothetical_doc(
+    query: str, ai_url: str | None = None, ai_model: str | None = None
+) -> str:
+    """HyDE: generate jawaban hipotetis singkat lalu embed hasilnya untuk retrieval.
 
-    # Generate query embedding sekali saja di awal untuk digunakan di semua domain
-    query_embedding = None
+    Embedding dari kalimat yang mirip jawaban lebih dekat ke dokumen di vector store
+    dibanding embedding dari pertanyaan langsung. Timeout 6s — fallback ke query asli.
+    """
+    cache_key = f"hyde:{query}"
+    cached = _cache_get(cache_key, _TTL_EMBEDDING)
+    if cached is not None:
+        return cached
+
+    url = ai_url
+    model = ai_model
+    if not url or not model:
+        url, model = await _get_ai_config()
+
     try:
-        query_embedding = await _get_query_embedding(query, ai_url=ai_url)
-    except Exception as e:
-        print(f"[WARN] Gagal mengambil embedding query: {e}")
+        llm = _get_llm(url, model)
+        chain = _HYDE_PROMPT | llm | StrOutputParser()
+        hyp = await asyncio.wait_for(chain.ainvoke({"query": query}), timeout=6.0)
+        result = hyp.strip() or query
+    except Exception:
+        result = query  # fallback ke query asli agar retrieval tetap berjalan
 
-    for domain in target_domains:
-        cfg = DOMAINS[domain]
+    _cache_set(cache_key, result)
+    return result
 
-        # Vector similarity search (hanya jika embedding berhasil di-generate)
-        if query_embedding:
-            docs = await _query_surrealdb_vector(query_embedding, cfg["vector"], n_results)
-            if docs:
-                context_parts.append(f"[Vector Search · {domain}]")
-                context_parts.extend(f"  • {doc}" for doc in docs)
-                vector_hits += len(docs)
 
-        # Structured aggregate query
+async def _fetch_single_domain(
+    domain: str,
+    query: str,
+    query_embedding: list[float] | None,
+    keywords: str,
+    n_results: int,
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    """Fetch vector + BM25 + re-rank + structured aggregate untuk satu domain.
+
+    Pipeline retrieval per domain:
+      1. Vector search (cosine, n*3 kandidat) + BM25 — paralel
+      2. RRF fusion — gabungkan dua ranking
+      3. Cross-encoder re-rank — pilih top-K paling relevan
+      4. Structured aggregate — dari cache atau SurrealDB
+    """
+    cfg = DOMAINS[domain]
+    pool = n_results * 3  # ambil lebih banyak kandidat untuk re-ranker
+
+    async def _empty() -> list[str]:
+        return []
+
+    vector_task = (
+        _query_surrealdb_vector(query_embedding, cfg["vector"], pool)
+        if query_embedding
+        else _empty()
+    )
+    bm25_task = _query_surrealdb_bm25(keywords, cfg["vector"], pool)
+
+    vector_docs, bm25_docs = await asyncio.gather(vector_task, bm25_task, return_exceptions=True)
+
+    if isinstance(vector_docs, Exception):
+        vector_docs = []
+    if isinstance(bm25_docs, Exception):
+        bm25_docs = []
+
+    # RRF: gabungkan kedua ranking list
+    fused_docs = _rrf(vector_docs, bm25_docs)
+
+    # Cross-encoder re-rank: pilih top n_results dari pool fused_docs
+    final_docs = await _rerank_async(query, fused_docs, top_k=n_results)
+
+    cache_key = f"agg:{domain}"
+    records = _cache_get(cache_key, _TTL_AGGREGATE)
+    if records is None:
         try:
             records = await _query_surrealdb(cfg["summary"])
         except Exception:
             records = []
+        _cache_set(cache_key, records)
+
+    return domain, final_docs, records
+
+
+async def _build_rag_context(
+    query: str, n_results: int, target_domains: list[str], ai_url: str | None = None
+) -> tuple[str, int, int]:
+    """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan.
+
+    Embedding di-cache per query string. Semua domain di-fetch secara concurrent
+    dengan asyncio.gather sehingga latency tidak bertambah linear dengan jumlah domain.
+    """
+    # HyDE: embed hypothetical document, bukan query mentah.
+    # Cache gabungan hyde+embed agar kedua langkah tidak diulang untuk query yang sama.
+    embed_key = f"emb:{query}"
+    query_embedding: list[float] | None = _cache_get(embed_key, _TTL_EMBEDDING)
+    if query_embedding is None:
+        hyde_text = await _generate_hypothetical_doc(query, ai_url=ai_url)
+        try:
+            query_embedding = await _get_query_embedding(hyde_text, ai_url=ai_url)
+            _cache_set(embed_key, query_embedding)
+        except Exception as e:
+            print(f"[WARN] Gagal mengambil embedding query: {e}")
+
+    # Query expansion: gabungkan keyword query dengan sinonim dari domain registry
+    keywords = _expand_keywords(_extract_keywords(query), target_domains)
+
+    # Parallel fetch semua domain sekaligus (vector + BM25 + re-rank + aggregate)
+    tasks = [_fetch_single_domain(d, query, query_embedding, keywords, n_results) for d in target_domains]
+    domain_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    context_parts: list[str] = []
+    vector_hits = 0
+    surreal_hits = 0
+
+    for result in domain_results:
+        if isinstance(result, Exception):
+            continue
+        domain, vector_docs, records = result
+
+        if vector_docs:
+            context_parts.append(f"[Vector Search · {domain}]")
+            context_parts.extend(f"  • {doc}" for doc in vector_docs)
+            vector_hits += len(vector_docs)
 
         if records:
             context_parts.append(f"[Agregat · {domain}]")
             for record in records[:8]:
-                snippet = ", ".join(
-                    f"{k}={v}" for k, v in record.items() if v is not None
-                )
+                snippet = ", ".join(f"{k}={v}" for k, v in record.items() if v is not None)
                 context_parts.append(f"  • {snippet}")
             surreal_hits += len(records)
 
@@ -437,6 +693,21 @@ async def build_context(payload: ContextRequest) -> ContextResponse:
     )
 
 
+# ─── Self-RAG Helper ──────────────────────────────────────────────────────────
+
+_INSUFFICIENT_MARKERS = [
+    "tidak ada data", "tidak ditemukan", "data tidak cukup",
+    "tidak tersedia", "belum ada", "tidak dapat menemukan",
+    "tidak memiliki informasi", "tidak terdapat", "kurang informasi",
+]
+
+
+def _is_insufficient(answer: str) -> bool:
+    """Cek apakah jawaban LLM mengindikasikan konteks tidak cukup."""
+    lower = answer.lower()
+    return any(marker in lower for marker in _INSUFFICIENT_MARKERS)
+
+
 # ─── Generate (RAG + LLM via LangChain) ──────────────────────────────────────
 
 
@@ -466,18 +737,40 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
             source = "surrealdb_vector+structured+ollama"
 
     try:
-        # Jika konteks kosong, gunakan prompt minimal agar respons super cepat
         has_real_context = bool(context and context != "(no context)" and "Tidak ada data operasional" not in context)
         chain = await _build_chain(
             has_context=has_real_context,
             ai_url=payload.ai_url,
             ai_model=payload.ai_model
         )
-        
+
         if has_real_context:
             answer = chain.invoke({"context": context, "query": query})
         else:
             answer = chain.invoke({"query": query})
+
+        # Self-RAG: jika jawaban mengindikasikan data tidak cukup dan masih ada
+        # domain yang belum dicari, retry sekali dengan seluruh domain.
+        if (
+            payload.use_rag
+            and _is_insufficient(answer)
+            and len(matched_domains) < len(DOMAINS)
+        ):
+            all_domains = list(DOMAINS.keys())
+            retry_context, rv, rs = await _build_rag_context(
+                query, payload.n_results, all_domains, ai_url=payload.ai_url
+            )
+            if retry_context and "Tidak ada data" not in retry_context:
+                retry_chain = await _build_chain(
+                    has_context=True,
+                    ai_url=payload.ai_url,
+                    ai_model=payload.ai_model,
+                )
+                answer = retry_chain.invoke({"context": retry_context, "query": query})
+                context, vector_hits, surreal_hits = retry_context, rv, rs
+                matched_domains = all_domains
+                source = "surrealdb_self_rag_retry+ollama"
+
     except Exception as error:
         import traceback
         print(f"[ERROR] Gagal memanggil LLM: {error}")
@@ -493,6 +786,45 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
         surreal_hits=surreal_hits,
         matched_domains=matched_domains,
     )
+
+
+@app.post("/mcp/generate/stream")
+async def generate_stream(payload: GenerateRequest) -> StreamingResponse:
+    """RAG retrieval + LLM generation dengan token streaming (text/plain chunked).
+
+    Token dikirim ke client saat LLM menghasilkannya — user tidak perlu menunggu
+    seluruh jawaban selesai. Context-building tetap dilakukan sebelum streaming mulai.
+    """
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query tidak boleh kosong.")
+
+    context = ""
+    matched_domains: list[str] = []
+
+    if payload.use_rag:
+        target_domains = [d for d in _detect_intent(query) if d in DOMAINS]
+        matched_domains = target_domains
+        if target_domains:
+            context, _, _ = await _build_rag_context(
+                query, payload.n_results, target_domains, ai_url=payload.ai_url
+            )
+
+    has_real_context = bool(
+        context and context != "(no context)" and "Tidak ada data operasional" not in context
+    )
+    chain = await _build_chain(
+        has_context=has_real_context,
+        ai_url=payload.ai_url,
+        ai_model=payload.ai_model,
+    )
+    input_data = {"context": context, "query": query} if has_real_context else {"query": query}
+
+    async def token_generator():
+        async for chunk in chain.astream(input_data):
+            yield chunk
+
+    return StreamingResponse(token_generator(), media_type="text/plain")
 
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
