@@ -420,6 +420,119 @@ Semua komunikasi antar service berjalan di dalam Docker network internal. Hanya 
 
 ---
 
+## Alur Metodologi Penelitian (Tahap 1–4)
+
+Bagian ini memetakan tahapan penelitian ke implementasi teknis, sekaligus mengoreksi posisi **Strategi Prompt Engineering** yang sering keliru ditempatkan paralel dengan RAG. Prompt Engineering bekerja **setelah** retrieval RAG, bukan setara dengannya.
+
+### Tahap 1 — Integrasi dan Persiapan Data Operasional
+
+```
+Metadata Operasional SIMRS (PostgreSQL raw_*)
+    ↓
+[Pipeline Service] Proses Data Refinement (Pandas)
+    ↓
+[Pipeline Service] Sync → SurrealDB clean_*
+    ↓
+[Pipeline Service] Embed → SurrealDB vector index (HNSW)
+    ↓
+Data Operasional Terstruktur (SurrealDB clean_* + vector)
+```
+
+Orkestrasi oleh n8n (cron 1 menit): `/refine` → `/sync` → `/embed`.
+
+---
+
+### Tahap 2 — Pengembangan Modul Analitik Berbasis AI
+
+Ini adalah tahap yang paling sering disalah-gambarkan. Alur yang benar di dalam **MCP Server**:
+
+```
+Query Pengguna
+    │
+    ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    MCP Server (Port 8100)                     │
+│                                                               │
+│  Fungsi 1 — Data Connector                                    │
+│  SurrealDB clean_* → Structured Query (GROUP BY) → Konteks   │
+│                                        │                      │
+│  Fungsi 2 — Context Manager (Arsitektur RAG)                 │
+│  Query → Embedding (nomic-embed-text)                         │
+│        → Vector Search SurrealDB (cosine similarity)         │
+│        → Semantic Context                                     │
+│                                        │                      │
+│                               ─────────┘                      │
+│                               ↓                               │
+│  Fungsi 3 — Strategi Prompt Engineering                       │
+│  context (structured + semantic) + query                      │
+│        → PromptTemplate.format(context=..., query=...)        │
+│        → Final Prompt                                         │
+│                               ↓                               │
+│  Fungsi 4 — LLM Generation (via LangChain LCEL)              │
+│  Final Prompt → OllamaLLM (qwen3.5:2b) → StrOutputParser     │
+│                               ↓                               │
+│                         Jawaban / Insight                     │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**Aturan posisi Prompt Engineering:**
+
+| Komponen | Posisi dalam Pipeline | Hubungan |
+|---|---|---|
+| Arsitektur RAG | Sebelum Prompt Engineering | Output RAG (context) → masuk ke Prompt |
+| Strategi Prompt Engineering | Setelah RAG, sebelum LLM | Merakit context + query → final prompt |
+| MCP Server | Container semua komponen | Bukan hanya "protocol", tapi service lengkap |
+
+**Yang salah (jangan gambarkan seperti ini):**
+```
+AI Module ↔ MCP ↔ RAG          ← MCP dan Prompt Engineering paralel
+AI Module ↔ Prompt Eng ↔ RAG   ← Prompt Engineering berinteraksi langsung dgn RAG
+```
+
+**Yang benar:**
+```
+RAG retrieval → Prompt Engineering → LLM   ← sequential, satu arah
+```
+
+---
+
+### Tahap 3 — Pembangunan Sistem Analitik & Visualisasi Dashboard
+
+```
+Hasil Analisis AI (MCP Server output)
+    ↓
+FastAPI Backend → React Frontend
+    ↓
+Dashboard Interaktif (8 KPI card + 5 chart)
+    + Metabase embedded (reporting BI)
+    ↓
+Insight Operasional
+    ↓
+[Human-in-the-Loop Validation]
+    ├── Valid   → Digunakan sebagai referensi manajemen
+    └── Tidak Valid → Refinement query ke MCP Server
+```
+
+---
+
+### Tahap 4 — Validasi Sistem dan Evaluasi Pengguna
+
+```
+UAT bersama Manajemen RS
+    ↓
+Evaluasi dan Penyempurnaan Sistem
+    ↓
+Luaran:
+  - Prototipe (sistem ini)
+  - Paten Sederhana
+  - Publikasi Ilmiah
+  - Materi Ajar
+    ↓
+Prototype Sistem Analitik Manajerial Berbasis AI untuk DARSI Management
+```
+
+---
+
 ## Human-in-the-Loop Architecture
 
 ```

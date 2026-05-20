@@ -11,6 +11,7 @@ Dipanggil oleh pipeline-service via POST /pipeline/embed.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from datetime import datetime
@@ -29,8 +30,8 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM = 768  # nomic-embed-text output dimension
 
-RECORD_LIMIT = 500   # max records per domain
-BATCH_SIZE = 50      # records per SurrealDB bulk insert
+RECORD_LIMIT = 40   # max records per domain
+BATCH_SIZE = 40      # records per SurrealDB bulk insert
 
 DOMAINS = [
     "pasien_aktif",
@@ -61,10 +62,16 @@ def _headers() -> dict[str, str]:
     }
 
 
+surreal_session = requests.Session()
+surreal_session.auth = (SURREALDB_USER, SURREALDB_PASSWORD)
+surreal_session.headers.update(_headers())
+
+ollama_session = requests.Session()
+
+
 def surreal_query(sql: str) -> list[dict]:
-    resp = requests.post(
-        _sql_endpoint(), data=sql, headers=_headers(),
-        auth=(SURREALDB_USER, SURREALDB_PASSWORD), timeout=30,
+    resp = surreal_session.post(
+        _sql_endpoint(), data=sql, timeout=30,
     )
     resp.raise_for_status()
     payload = resp.json()
@@ -77,18 +84,37 @@ def surreal_query(sql: str) -> list[dict]:
 
 
 def surreal_exec(sql: str) -> None:
-    resp = requests.post(
-        _sql_endpoint(), data=sql, headers=_headers(),
-        auth=(SURREALDB_USER, SURREALDB_PASSWORD), timeout=60,
+    resp = surreal_session.post(
+        _sql_endpoint(), data=sql, timeout=60,
     )
     resp.raise_for_status()
 
 
 # ─── Ollama embedding ─────────────────────────────────────────────────────────
 
+_cached_ollama_url = None
+
+def _get_dynamic_ollama_url() -> str:
+    global _cached_ollama_url
+    if _cached_ollama_url is not None:
+        return _cached_ollama_url
+
+    try:
+        r = requests.get("http://backend:8000/api/settings/ai", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("url"):
+                _cached_ollama_url = data["url"]
+                return _cached_ollama_url
+    except Exception:
+        pass
+    _cached_ollama_url = OLLAMA_BASE_URL
+    return _cached_ollama_url
+
 def get_embedding(text: str) -> list[float]:
-    resp = requests.post(
-        f"{OLLAMA_BASE_URL}/api/embeddings",
+    url = _get_dynamic_ollama_url()
+    resp = ollama_session.post(
+        f"{url}/api/embeddings",
         json={"model": EMBED_MODEL, "prompt": text},
         timeout=30,
     )
@@ -159,11 +185,19 @@ def row_to_text(domain: str, row: dict) -> str:
 def setup_vector_table(domain: str) -> None:
     table = f"vector_darsi_{domain}"
     sql = (
+        # Analyzer shared — didefinisikan sekali, IF NOT EXISTS idempotent
+        "DEFINE ANALYZER IF NOT EXISTS darsi_analyzer "
+        "TOKENIZERS blank FILTERS lowercase,ascii; "
         f"DEFINE TABLE IF NOT EXISTS {table} SCHEMALESS; "
         f"DELETE {table}; "
+        # HNSW index untuk cosine similarity (vector search)
         f"DEFINE INDEX IF NOT EXISTS idx_hnsw_{domain} "
         f"ON TABLE {table} FIELDS embedding "
-        f"HNSW DIMENSION {EMBED_DIM} DIST COSINE;"
+        f"HNSW DIMENSION {EMBED_DIM} DIST COSINE; "
+        # BM25 full-text search index pada field text
+        f"DEFINE INDEX IF NOT EXISTS idx_ft_{domain} "
+        f"ON TABLE {table} FIELDS text "
+        f"SEARCH ANALYZER darsi_analyzer BM25;"
     )
     surreal_exec(sql)
 
@@ -178,19 +212,29 @@ def embed_domain(domain: str) -> int:
 
     setup_vector_table(domain)
 
+    texts = [row_to_text(domain, record) for record in records]
+    embeddings: list[list[float] | None] = [None] * len(records)
+
+    def _fetch_one(idx: int) -> None:
+        try:
+            embeddings[idx] = get_embedding(texts[idx])
+        except Exception as exc:
+            print(f"   [WARN] {domain} baris {idx}: embedding gagal — {exc}")
+
+    # Fetch embeddings in parallel using up to 4 threads
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        executor.map(_fetch_one, range(len(records)))
+
     count = 0
     batch: list[str] = []
 
     for i, record in enumerate(records):
-        text = row_to_text(domain, record)
-        try:
-            embedding = get_embedding(text)
-        except Exception as exc:
-            print(f"   [WARN] {domain} baris {i}: embedding gagal — {exc}")
+        embedding = embeddings[i]
+        if embedding is None:
             continue
 
         payload = json.dumps(
-            {"doc_id": f"{domain}_{i}", "domain": domain, "text": text, "embedding": embedding},
+            {"doc_id": f"{domain}_{i}", "domain": domain, "text": texts[i], "embedding": embedding},
             ensure_ascii=True,
         )
         batch.append(f"CREATE vector_darsi_{domain} CONTENT {payload};")

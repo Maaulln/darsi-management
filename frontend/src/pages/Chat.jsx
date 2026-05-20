@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { apiPost } from '../api';
+import { apiPostStream } from '../api';
 
 const SUGGESTIONS = [
   'Berapa pasien aktif hari ini?',
@@ -13,12 +13,24 @@ export default function Chat() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [useRag, setUseRag] = useState(true);
+  const [activeModel, setActiveModel] = useState('Memuat...');
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    fetch('/api/settings/ai')
+      .then(r => r.json())
+      .then(data => {
+        setActiveModel(data.model || 'qwen3.5:2b (Lokal)');
+      })
+      .catch(() => {
+        setActiveModel('qwen3.5:2b (Lokal)');
+      });
+  }, []);
 
   const handleSend = async (text = input) => {
     const msg = text.trim();
@@ -31,23 +43,38 @@ export default function Chat() {
     }
 
     setMessages(prev => [...prev, { role: 'user', content: msg }]);
+    // Tambahkan placeholder AI message yang akan diisi token per token
+    setMessages(prev => [...prev, { role: 'ai', content: '', streaming: true }]);
 
     try {
-      const res = await apiPost('/api/chat', { message: msg, use_rag: useRag });
-      setMessages(prev => [
-        ...prev,
-        {
-          role: 'ai',
-          content: res.response || '(Tidak ada respons)',
-          source: res.source,
-          domains: res.matched_domains ?? [],
-        },
-      ]);
+      await apiPostStream(
+        '/api/chat/stream',
+        { message: msg, use_rag: useRag },
+        (chunk) => {
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            updated[updated.length - 1] = { ...last, content: last.content + chunk };
+            return updated;
+          });
+        }
+      );
+      // Tandai streaming selesai
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = { ...updated[updated.length - 1], streaming: false };
+        return updated;
+      });
     } catch (e) {
-      setMessages(prev => [
-        ...prev,
-        { role: 'ai', content: `Terjadi kesalahan: ${e.message}`, isError: true },
-      ]);
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: 'ai',
+          content: `Terjadi kesalahan: ${e.message}`,
+          isError: true,
+        };
+        return updated;
+      });
     } finally {
       setSending(false);
       setTimeout(() => inputRef.current?.focus(), 50);
@@ -81,6 +108,9 @@ export default function Chat() {
           />
           RAG (konteks data operasional)
         </label>
+        <span style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--muted)', background: '#f1f5f9', padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--border)' }}>
+          Model: <strong>{activeModel}</strong>
+        </span>
         <span style={{ flex: 1 }} />
         {messages.length > 0 && (
           <button
@@ -113,8 +143,11 @@ export default function Chat() {
         ) : (
           messages.map((msg, i) => (
             <div key={i} className={`msg ${msg.role}`}>
-              <div className="msg-bubble">{msg.content}</div>
-              {msg.role === 'ai' && (msg.source || msg.domains?.length > 0 || msg.isError) && (
+              <div className="msg-bubble">
+                {msg.content}
+                {msg.streaming && <span className="streaming-cursor">▍</span>}
+              </div>
+              {msg.role === 'ai' && !msg.streaming && (msg.source || msg.domains?.length > 0 || msg.isError) && (
                 <div className="msg-meta">
                   {msg.isError && <span className="meta-tag error-tag">error</span>}
                   {msg.source && <span className="meta-tag source">{msg.source}</span>}
