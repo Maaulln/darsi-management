@@ -1,7 +1,13 @@
+networks:
+  darsi-net:
+    driver: bridge
+
 services:
   postgres:
     image: postgres:16
     container_name: darsi-postgres
+    networks:
+      - darsi-net
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-darsi}
       POSTGRES_USER: ${POSTGRES_USER:-darsi_user}
@@ -20,6 +26,8 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:latest
     container_name: darsi-surrealdb
+    networks:
+      - darsi-net
     user: root
     command: start --log info --username ${SURREALDB_USER:-root} --password ${SURREALDB_PASSWORD:-root} surrealkv:///data/darsi
     ports:
@@ -35,6 +43,8 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: darsi-ollama
+    networks:
+      - darsi-net
     ports:
       - "11434:11434"
     volumes:
@@ -47,6 +57,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: darsi-backend
+    networks:
+      - darsi-net
     env_file:
       - .env
     environment:
@@ -70,6 +82,8 @@ services:
       context: ./mcp-server
       dockerfile: Dockerfile
     container_name: darsi-mcp-server
+    networks:
+      - darsi-net
     environment:
       SURREALDB_URL: http://surrealdb:8000
       SURREALDB_USER: ${SURREALDB_USER:-root}
@@ -90,6 +104,8 @@ services:
   simrs-simulator:
     image: python:3.11-slim
     container_name: darsi-simrs-simulator
+    networks:
+      - darsi-net
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -117,6 +133,8 @@ services:
       context: ./pipeline-service
       dockerfile: Dockerfile
     container_name: darsi-pipeline-service
+    networks:
+      - darsi-net
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -146,6 +164,8 @@ services:
   n8n:
     image: n8nio/n8n:latest
     container_name: darsi-n8n
+    networks:
+      - darsi-net
     ports:
       - "5678:5678"
     volumes:
@@ -156,12 +176,15 @@ services:
       N8N_PROTOCOL: http
       WEBHOOK_URL: http://localhost:5678
     depends_on:
-      - pipeline-service
+      pipeline-service:
+        condition: service_started
     restart: unless-stopped
 
   metabase:
     image: metabase/metabase:latest
     container_name: darsi-metabase
+    networks:
+      - darsi-net
     ports:
       - "3001:3000"
     volumes:
@@ -177,6 +200,8 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: darsi-frontend
+    networks:
+      - darsi-net
     depends_on:
       - backend
     restart: unless-stopped
@@ -184,6 +209,8 @@ services:
   nginx:
     image: nginx:1.27-alpine
     container_name: darsi-nginx
+    networks:
+      - darsi-net
     ports:
       - "8080:80"
     volumes:

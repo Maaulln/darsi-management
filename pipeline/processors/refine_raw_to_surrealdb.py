@@ -119,7 +119,7 @@ def transform_to_clean_records(dataframe: pd.DataFrame) -> list[dict[str, object
     return normalized_frame.to_dict(orient="records")
 
 
-_BATCH_SIZE: Final[int] = 50
+_BATCH_SIZE: Final[int] = 200
 
 
 def build_domain_init_query(domain_name: str) -> str:
