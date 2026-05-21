@@ -26,11 +26,11 @@ async def readiness() -> dict[str, object]:
     """Periksa konektivitas: MCP server (liveness) + semua downstream via MCP."""
     status: dict[str, object] = {}
 
-    mcp_live = mcp_client.health()
+    mcp_live = await mcp_client.health()
     status["mcp_server"] = "ok" if mcp_live.get("status") == "ok" else f"down: {mcp_live}"
 
     if status["mcp_server"] == "ok":
-        downstream = mcp_client.health_downstream()
+        downstream = await mcp_client.health_downstream()
         status["surrealdb"] = downstream.get("surrealdb", "unknown")
         status["ollama"] = downstream.get("ollama", "unknown")
     else:

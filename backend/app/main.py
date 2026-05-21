@@ -17,10 +17,11 @@ def create_app() -> FastAPI:
     """Membuat instance aplikasi FastAPI dengan seluruh router DARSI."""
 
     app = FastAPI(title=settings.app_name)
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
+        allow_origins=origins,
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )

@@ -20,6 +20,7 @@ Endpoint:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -38,12 +39,44 @@ from sentence_transformers import CrossEncoder
 app = FastAPI(title="DARSI MCP Server")
 
 
+_SURREAL_HTTP: httpx.AsyncClient | None = None
+
+
+def _get_surreal_http() -> httpx.AsyncClient:
+    global _SURREAL_HTTP
+    if _SURREAL_HTTP is None or _SURREAL_HTTP.is_closed:
+        _SURREAL_HTTP = httpx.AsyncClient(timeout=10)
+    return _SURREAL_HTTP
+
+
+async def _cache_evict_loop() -> None:
+    """Hapus cache entry yang sudah expired setiap 5 menit."""
+    while True:
+        await asyncio.sleep(300)
+        now = time.monotonic()
+        expired = [k for k, (_, ts) in list(_CACHE.items()) if (now - ts) > 600]
+        for k in expired:
+            _CACHE.pop(k, None)
+        if expired:
+            print(f"[INFO] Cache evicted {len(expired)} expired entries")
+
+
 @app.on_event("startup")
-async def _preload_cross_encoder() -> None:
-    """Pre-load cross-encoder saat startup agar request pertama tidak kena cold-start."""
-    loop = asyncio.get_event_loop()
+async def _startup() -> None:
+    """Inisialisasi shared HTTP client, pre-load cross-encoder, dan cache eviction."""
+    global _SURREAL_HTTP
+    _SURREAL_HTTP = httpx.AsyncClient(timeout=10)
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_cross_encoder)
+    asyncio.create_task(_cache_evict_loop())
     print(f"[INFO] Cross-encoder loaded: {_CROSS_ENCODER_MODEL}")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _SURREAL_HTTP
+    if _SURREAL_HTTP and not _SURREAL_HTTP.is_closed:
+        await _SURREAL_HTTP.aclose()
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -63,9 +96,11 @@ EMBED_DIM = 768
 # dan AI config agar tidak dipanggil ulang setiap request.
 
 _CACHE: dict[str, tuple[Any, float]] = {}
-_TTL_AGGREGATE = 60.0   # detik — sinkron dengan interval n8n pipeline
-_TTL_EMBEDDING = 300.0  # 5 menit — query sama sering diulang user
-_TTL_AI_CONFIG = 30.0   # 30 detik — setting jarang berubah
+_TTL_AGGREGATE    = 60.0   # detik — sinkron dengan interval n8n pipeline
+_TTL_EMBEDDING    = 300.0  # 5 menit — query sama sering diulang user
+_TTL_AI_CONFIG    = 30.0   # 30 detik — setting jarang berubah
+_TTL_RETRIEVAL    = 120.0  # 2 menit — vector/BM25 results per (domain, query)
+_TTL_LLM_RESPONSE = 60.0  # 1 menit — full LLM answer per query
 
 
 def _cache_get(key: str, ttl: float) -> Any | None:
@@ -78,6 +113,16 @@ def _cache_get(key: str, ttl: float) -> Any | None:
 
 def _cache_set(key: str, value: Any) -> None:
     _CACHE[key] = (value, time.monotonic())
+
+
+def _qhash(text: str) -> str:
+    """Hash MD5 pendek untuk cache key retrieval."""
+    return hashlib.md5(text.encode()).hexdigest()[:10]
+
+
+async def _noop(value: Any) -> Any:
+    """Coroutine placeholder — langsung return nilai cache hit."""
+    return value
 
 
 # ─── LLM Singleton Pool ───────────────────────────────────────────────────────
@@ -110,36 +155,88 @@ def _get_cross_encoder() -> CrossEncoder:
     return _CROSS_ENCODER
 
 
-async def _rerank_async(query: str, docs: list[str], top_k: int) -> list[str]:
-    """Re-rank dokumen kandidat dengan cross-encoder secara non-blocking.
+async def _rerank_batch_async(
+    query: str,
+    domain_docs: list[tuple[str, list[str]]],
+    top_k: int,
+) -> dict[str, list[str]]:
+    """Batch cross-encoder re-rank untuk semua domain sekaligus — satu CPU call.
 
-    Cross-encoder membaca pasangan (query, doc) dan memberi skor relevansi
-    yang jauh lebih akurat dibanding cosine similarity embedding.
-    Dijalankan di thread pool agar tidak memblokir event loop.
+    Menggabungkan semua kandidat dokumen dari setiap domain ke dalam satu
+    predict() call, lebih efisien dibanding N panggilan per-domain terpisah.
+    Mengembalikan dict {domain: [top_k docs]}.
     """
-    if not docs or len(docs) <= top_k:
-        return docs
+    if not domain_docs:
+        return {}
+
+    # Flatten: [(domain, doc), ...]
+    flat: list[tuple[str, str]] = [
+        (domain, doc)
+        for domain, docs in domain_docs
+        for doc in docs
+    ]
+    if not flat:
+        return {domain: [] for domain, _ in domain_docs}
+
     ce = _get_cross_encoder()
-    pairs = [(query, doc) for doc in docs]
-    loop = asyncio.get_event_loop()
-    scores = await loop.run_in_executor(None, ce.predict, pairs)
-    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in ranked[:top_k]]
+    pairs = [(query, doc) for _, doc in flat]
+    loop = asyncio.get_running_loop()
+    all_scores = await loop.run_in_executor(None, ce.predict, pairs)
+
+    # Grup skor kembali per domain
+    domain_scored: dict[str, list[tuple[float, str]]] = {}
+    for (domain, doc), score in zip(flat, all_scores):
+        domain_scored.setdefault(domain, []).append((score, doc))
+
+    return {
+        domain: [doc for _, doc in sorted(scored, key=lambda x: x[0], reverse=True)[:top_k]]
+        for domain, scored in domain_scored.items()
+    }
+
+
+def _truncate_context(ctx: str, limit: int = 6000) -> str:
+    """Potong context di batas karakter terakhir yang lengkap (baris penuh).
+
+    Model 2B tidak perlu context >6000 karakter (~1500 token) —
+    terlalu banyak justru menurunkan fokus dan memperlambat generasi.
+    """
+    if len(ctx) <= limit:
+        return ctx
+    truncated = ctx[:limit]
+    last_nl = truncated.rfind('\n')
+    return truncated[:last_nl] if last_nl > 0 else truncated
+
+
+def _rank_retry_domains(query: str, checked: list[str]) -> list[str]:
+    """Ranking domain yang belum dicari berdasarkan relevansi terhadap query.
+
+    Digunakan Self-RAG retry agar tidak membabi-buta mencari ke 13 domain —
+    cukup top-5 domain yang paling relevan dengan kata kunci query.
+    """
+    q_lower = query.lower()
+    q_words = set(q_lower.split())
+    unchecked = [d for d in DOMAINS if d not in checked]
+
+    def _score(domain: str) -> float:
+        kws = DOMAINS[domain]["keywords"]
+        exact = sum(1.0 for kw in kws if kw in q_lower)
+        word_overlap = len(q_words & set(" ".join(kws).split()))
+        return exact * 2.0 + word_overlap * 0.5
+
+    return sorted(unchecked, key=_score, reverse=True)[:5]
+
 
 # ─── LangChain Chain ─────────────────────────────────────────────────────────
 
-# Chain-of-Thought prompt: arahkan LLM untuk mengidentifikasi data dulu,
-# baru analisis, baru jawab — meningkatkan akurasi signifikan pada model kecil (2B).
+# Prompt ringkas dan terarah untuk model kecil (2B) — hindari instruksi verbose
+# yang memaksa model menghasilkan terlalu banyak token sebelum menjawab inti.
 _PROMPT_TEMPLATE = PromptTemplate.from_template(
-    "Anda adalah asisten analitik operasional rumah sakit DARSI Surabaya.\n\n"
-    "KONTEKS DATA OPERASIONAL:\n"
-    "{context}\n\n"
+    "Anda adalah analis data RS DARSI Surabaya.\n\n"
+    "DATA OPERASIONAL:\n{context}\n\n"
     "PERTANYAAN: {query}\n\n"
-    "Jawab dengan urutan berikut:\n"
-    "1. Data relevan: sebutkan angka atau fakta kunci dari konteks\n"
-    "2. Analisis: interpretasikan angka tersebut\n"
-    "3. Jawaban: berikan kesimpulan ringkas dalam Bahasa Indonesia\n"
-    "Jika data tidak cukup, sebutkan apa yang tersedia dan data apa yang kurang.\n\n"
+    "Instruksi: Jawab singkat dan spesifik dalam Bahasa Indonesia. "
+    "Gunakan HANYA data di atas. Sebutkan angka/fakta kunci. "
+    "Jika data tidak cukup, nyatakan secara eksplisit.\n\n"
     "JAWABAN:"
 )
 
@@ -323,29 +420,31 @@ class GenerateResponse(BaseModel):
 # ─── Internal Helpers ─────────────────────────────────────────────────────────
 
 
+_SURREAL_SQL_ENDPOINT = SURREALDB_URL.rstrip("/").replace("/rpc", "") + "/sql"
+_SURREAL_HEADERS = {
+    "Accept": "application/json",
+    "surreal-ns": SURREALDB_NS,
+    "surreal-db": SURREALDB_DB,
+    "NS": SURREALDB_NS,
+    "DB": SURREALDB_DB,
+}
+
+
 async def _query_surrealdb(sql: str) -> list[dict[str, Any]]:
     """Eksekusi SQL ke SurrealDB. Kembalikan list dari result statement terakhir."""
-    sql_endpoint = SURREALDB_URL.rstrip("/").replace("/rpc", "") + "/sql"
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(
-            sql_endpoint,
-            content=sql,
-            headers={
-                "Accept": "application/json",
-                "surreal-ns": SURREALDB_NS,
-                "surreal-db": SURREALDB_DB,
-                "NS": SURREALDB_NS,
-                "DB": SURREALDB_DB,
-            },
-            auth=(SURREALDB_USER, SURREALDB_PASSWORD),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, list) and payload:
-            last = payload[-1]
-            if isinstance(last, dict):
-                result = last.get("result", [])
-                return result if isinstance(result, list) else []
+    response = await _get_surreal_http().post(
+        _SURREAL_SQL_ENDPOINT,
+        content=sql,
+        headers=_SURREAL_HEADERS,
+        auth=(SURREALDB_USER, SURREALDB_PASSWORD),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list) and payload:
+        last = payload[-1]
+        if isinstance(last, dict):
+            result = last.get("result", [])
+            return result if isinstance(result, list) else []
     return []
 
 
@@ -406,7 +505,7 @@ def _expand_keywords(keywords: str, target_domains: list[str]) -> str:
     Penggabungan ini meningkatkan recall BM25 tanpa memanggil LLM tambahan.
     """
     base = set(keywords.split())
-    for domain in target_domains[:3]:  # max 3 domain agar keyword tidak terlalu panjang
+    for domain in target_domains:  # semua domain yang terdeteksi
         base.update(DOMAINS[domain]["keywords"][:3])
     return " ".join(list(base)[:12])
 
@@ -498,31 +597,36 @@ async def _generate_hypothetical_doc(
 
 async def _fetch_single_domain(
     domain: str,
-    query: str,
     query_embedding: list[float] | None,
     keywords: str,
     n_results: int,
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
-    """Fetch vector + BM25 + re-rank + structured aggregate untuk satu domain.
+    """Fetch vector + BM25 + RRF + structured aggregate untuk satu domain.
 
-    Pipeline retrieval per domain:
-      1. Vector search (cosine, n*3 kandidat) + BM25 — paralel
-      2. RRF fusion — gabungkan dua ranking
-      3. Cross-encoder re-rank — pilih top-K paling relevan
-      4. Structured aggregate — dari cache atau SurrealDB
+    Re-ranking tidak dilakukan di sini — dikerjakan secara batch global
+    di _build_rag_context agar satu cross-encoder call cukup untuk semua domain.
+    Vector dan BM25 results di-cache per (domain, query/keywords) selama 2 menit.
     """
     cfg = DOMAINS[domain]
-    pool = n_results * 3  # ambil lebih banyak kandidat untuk re-ranker
+    pool = n_results * 3  # kandidat untuk RRF, lebih banyak dari top-K final
 
-    async def _empty() -> list[str]:
-        return []
+    # ── Vector search — cache per (domain, embedding hash) ───────────────────
+    vec_key = f"vec:{domain}:{_qhash(str(query_embedding))}" if query_embedding else ""
+    vector_docs: list[str] = _cache_get(vec_key, _TTL_RETRIEVAL) if vec_key else None  # type: ignore[assignment]
+
+    # ── BM25 search — cache per (domain, keywords hash) ──────────────────────
+    bm25_key = f"bm25:{domain}:{_qhash(keywords)}"
+    bm25_docs: list[str] = _cache_get(bm25_key, _TTL_RETRIEVAL)  # type: ignore[assignment]
 
     vector_task = (
-        _query_surrealdb_vector(query_embedding, cfg["vector"], pool)
-        if query_embedding
-        else _empty()
+        _noop(vector_docs) if vector_docs is not None
+        else _query_surrealdb_vector(query_embedding, cfg["vector"], pool) if query_embedding
+        else _noop([])
     )
-    bm25_task = _query_surrealdb_bm25(keywords, cfg["vector"], pool)
+    bm25_task = (
+        _noop(bm25_docs) if bm25_docs is not None
+        else _query_surrealdb_bm25(keywords, cfg["vector"], pool)
+    )
 
     vector_docs, bm25_docs = await asyncio.gather(vector_task, bm25_task, return_exceptions=True)
 
@@ -531,64 +635,100 @@ async def _fetch_single_domain(
     if isinstance(bm25_docs, Exception):
         bm25_docs = []
 
-    # RRF: gabungkan kedua ranking list
-    fused_docs = _rrf(vector_docs, bm25_docs)
+    if vec_key and _cache_get(vec_key, _TTL_RETRIEVAL) is None:
+        _cache_set(vec_key, vector_docs)
+    if _cache_get(bm25_key, _TTL_RETRIEVAL) is None:
+        _cache_set(bm25_key, bm25_docs)
 
-    # Cross-encoder re-rank: pilih top n_results dari pool fused_docs
-    final_docs = await _rerank_async(query, fused_docs, top_k=n_results)
+    # RRF: gabungkan dua ranking list, simpan pool untuk batch rerank global
+    fused_docs = _rrf(vector_docs, bm25_docs)[:pool]
 
-    cache_key = f"agg:{domain}"
-    records = _cache_get(cache_key, _TTL_AGGREGATE)
+    # Structured aggregate — cache 60s
+    agg_key = f"agg:{domain}"
+    records = _cache_get(agg_key, _TTL_AGGREGATE)
     if records is None:
         try:
             records = await _query_surrealdb(cfg["summary"])
         except Exception:
             records = []
-        _cache_set(cache_key, records)
+        _cache_set(agg_key, records)
 
-    return domain, final_docs, records
+    return domain, fused_docs, records
 
 
 async def _build_rag_context(
     query: str, n_results: int, target_domains: list[str], ai_url: str | None = None
 ) -> tuple[str, int, int]:
-    """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan.
+    """Susun konteks RAG dari SurrealDB vector + structured untuk domain yang ditargetkan.
 
-    Embedding di-cache per query string. Semua domain di-fetch secara concurrent
-    dengan asyncio.gather sehingga latency tidak bertambah linear dengan jumlah domain.
+    Optimasi utama vs versi sebelumnya:
+    - HyDE + direct embedding berjalan PARALEL (bukan sequential 4-11s)
+    - Cross-encoder re-rank satu batch untuk semua domain (bukan N call per domain)
+    - Context di-truncate ke 6000 char agar model 2B tidak kewalahan
     """
-    # HyDE: embed hypothetical document, bukan query mentah.
-    # Cache gabungan hyde+embed agar kedua langkah tidak diulang untuk query yang sama.
     embed_key = f"emb:{query}"
     query_embedding: list[float] | None = _cache_get(embed_key, _TTL_EMBEDDING)
-    if query_embedding is None:
-        hyde_text = await _generate_hypothetical_doc(query, ai_url=ai_url)
-        try:
-            query_embedding = await _get_query_embedding(hyde_text, ai_url=ai_url)
-            _cache_set(embed_key, query_embedding)
-        except Exception as e:
-            print(f"[WARN] Gagal mengambil embedding query: {e}")
 
-    # Query expansion: gabungkan keyword query dengan sinonim dari domain registry
+    if query_embedding is None:
+        # Jalankan HyDE+embed dan direct embed secara paralel.
+        # Direct embed lebih cepat; HyDE digunakan jika selesai dalam 3s tambahan.
+        async def _hyde_embed() -> list[float] | None:
+            try:
+                hyde_text = await _generate_hypothetical_doc(query, ai_url=ai_url)
+                return await _get_query_embedding(hyde_text, ai_url=ai_url)
+            except Exception:
+                return None
+
+        async def _direct_embed() -> list[float] | None:
+            try:
+                return await _get_query_embedding(query, ai_url=ai_url)
+            except Exception:
+                return None
+
+        hyde_task   = asyncio.create_task(_hyde_embed())
+        direct_task = asyncio.create_task(_direct_embed())
+
+        direct_result = await direct_task
+        try:
+            hyde_result = await asyncio.wait_for(asyncio.shield(hyde_task), timeout=3.0)
+            query_embedding = hyde_result or direct_result
+        except asyncio.TimeoutError:
+            hyde_task.cancel()
+            query_embedding = direct_result
+
+        if query_embedding is not None:
+            _cache_set(embed_key, query_embedding)
+        else:
+            print(f"[WARN] Gagal mendapatkan embedding untuk query: {query!r}")
+
+    # Query expansion: semua domain yang terdeteksi berkontribusi keyword
     keywords = _expand_keywords(_extract_keywords(query), target_domains)
 
-    # Parallel fetch semua domain sekaligus (vector + BM25 + re-rank + aggregate)
-    tasks = [_fetch_single_domain(d, query, query_embedding, keywords, n_results) for d in target_domains]
+    # Parallel fetch semua domain (vector + BM25 + RRF + aggregate)
+    tasks = [_fetch_single_domain(d, query_embedding, keywords, n_results) for d in target_domains]
     domain_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    valid: list[tuple[str, list[str], list[dict[str, Any]]]] = [
+        r for r in domain_results if not isinstance(r, Exception)
+    ]
+
+    # Batch cross-encoder re-rank: satu call untuk semua domain sekaligus
+    domain_docs_for_rerank = [(domain, fused) for domain, fused, _ in valid if fused]
+    reranked: dict[str, list[str]] = {}
+    if domain_docs_for_rerank:
+        reranked = await _rerank_batch_async(query, domain_docs_for_rerank, top_k=n_results)
 
     context_parts: list[str] = []
     vector_hits = 0
     surreal_hits = 0
 
-    for result in domain_results:
-        if isinstance(result, Exception):
-            continue
-        domain, vector_docs, records = result
+    for domain, fused_docs, records in valid:
+        final_docs = reranked.get(domain, fused_docs[:n_results])
 
-        if vector_docs:
+        if final_docs:
             context_parts.append(f"[Vector Search · {domain}]")
-            context_parts.extend(f"  • {doc}" for doc in vector_docs)
-            vector_hits += len(vector_docs)
+            context_parts.extend(f"  • {doc}" for doc in final_docs)
+            vector_hits += len(final_docs)
 
         if records:
             context_parts.append(f"[Agregat · {domain}]")
@@ -597,7 +737,7 @@ async def _build_rag_context(
                 context_parts.append(f"  • {snippet}")
             surreal_hits += len(records)
 
-    context = "\n".join(context_parts) if context_parts else ""
+    context = _truncate_context("\n".join(context_parts)) if context_parts else ""
     return context, vector_hits, surreal_hits
 
 
@@ -718,6 +858,12 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
     if not query:
         raise HTTPException(status_code=400, detail="Query tidak boleh kosong.")
 
+    # ── LLM Response Cache — kembalikan instan jika query sama dalam 60s ─────
+    llm_cache_key = f"llm:{_qhash(query)}"
+    cached_response = _cache_get(llm_cache_key, _TTL_LLM_RESPONSE)
+    if cached_response is not None:
+        return GenerateResponse(**{**cached_response, "source": cached_response["source"] + "+cached"})
+
     context = "(no context)"
     vector_hits = 0
     surreal_hits = 0
@@ -741,41 +887,54 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
         chain = await _build_chain(
             has_context=has_real_context,
             ai_url=payload.ai_url,
-            ai_model=payload.ai_model
+            ai_model=payload.ai_model,
         )
 
         if has_real_context:
-            answer = chain.invoke({"context": context, "query": query})
+            answer = await chain.ainvoke({"context": context, "query": query})
         else:
-            answer = chain.invoke({"query": query})
+            answer = await chain.ainvoke({"query": query})
 
-        # Self-RAG: jika jawaban mengindikasikan data tidak cukup dan masih ada
-        # domain yang belum dicari, retry sekali dengan seluruh domain.
+        # Self-RAG: retry dengan top-5 domain terpilih (bukan 13) jika data kurang.
         if (
             payload.use_rag
             and _is_insufficient(answer)
             and len(matched_domains) < len(DOMAINS)
         ):
-            all_domains = list(DOMAINS.keys())
-            retry_context, rv, rs = await _build_rag_context(
-                query, payload.n_results, all_domains, ai_url=payload.ai_url
-            )
-            if retry_context and "Tidak ada data" not in retry_context:
-                retry_chain = await _build_chain(
-                    has_context=True,
-                    ai_url=payload.ai_url,
-                    ai_model=payload.ai_model,
+            try:
+                retry_domains = matched_domains + _rank_retry_domains(query, matched_domains)
+                retry_context, rv, rs = await asyncio.wait_for(
+                    _build_rag_context(query, payload.n_results, retry_domains, ai_url=payload.ai_url),
+                    timeout=60.0,
                 )
-                answer = retry_chain.invoke({"context": retry_context, "query": query})
-                context, vector_hits, surreal_hits = retry_context, rv, rs
-                matched_domains = all_domains
-                source = "surrealdb_self_rag_retry+ollama"
+                if retry_context and "Tidak ada data" not in retry_context:
+                    retry_chain = await _build_chain(
+                        has_context=True,
+                        ai_url=payload.ai_url,
+                        ai_model=payload.ai_model,
+                    )
+                    answer = await asyncio.wait_for(
+                        retry_chain.ainvoke({"context": retry_context, "query": query}),
+                        timeout=120.0,
+                    )
+                    context, vector_hits, surreal_hits = retry_context, rv, rs
+                    matched_domains = retry_domains
+                    source = "surrealdb_self_rag_retry+ollama"
+            except asyncio.TimeoutError:
+                print("[WARN] Self-RAG retry timeout — menggunakan jawaban pertama")
 
     except Exception as error:
         import traceback
         print(f"[ERROR] Gagal memanggil LLM: {error}")
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"LLM error: {error}") from error
+
+    # Simpan ke cache untuk query yang sama dalam 60s berikutnya
+    _cache_set(llm_cache_key, {
+        "query": query, "answer": answer, "context_used": context,
+        "source": source, "vector_hits": vector_hits,
+        "surreal_hits": surreal_hits, "matched_domains": matched_domains,
+    })
 
     return GenerateResponse(
         query=query,
@@ -830,16 +989,36 @@ async def generate_stream(payload: GenerateRequest) -> StreamingResponse:
 # ─── Analytics ────────────────────────────────────────────────────────────────
 
 
+def _date_where(field: str, date_from: str | None, date_to: str | None) -> str:
+    """Build SurrealDB WHERE clause untuk filter rentang tanggal."""
+    parts: list[str] = []
+    if date_from:
+        parts.append(f"{field} >= '{date_from}T00:00:00Z'")
+    if date_to:
+        parts.append(f"{field} <= '{date_to}T23:59:59Z'")
+    return (" WHERE " + " AND ".join(parts)) if parts else ""
+
+
 @app.get("/mcp/analytics/overview")
-async def analytics_overview() -> dict[str, Any]:
+async def analytics_overview(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
     """KPI ringkasan tingkat tinggi dari semua domain."""
+    w_pasien = _date_where("snapshot_at", date_from, date_to)
+    w_occ    = _date_where("observed_at", date_from, date_to)
+    w_listrik = _date_where("reading_at", date_from, date_to)
+    w_air    = _date_where("reading_at", date_from, date_to)
+    w_biaya  = _date_where("period_month", date_from, date_to)
+    w_lembur = _date_where("overtime_date", date_from, date_to)
+
     queries = {
-        "pasien_total": "SELECT count() AS total FROM clean_pasien_aktif GROUP ALL",
-        "okupansi": "SELECT math::sum(bed_capacity) AS capacity, math::sum(bed_occupied) AS occupied FROM clean_okupansi_kamar GROUP ALL",
-        "listrik": "SELECT math::sum(kwh_total) AS kwh FROM clean_meter_listrik GROUP ALL",
-        "air": "SELECT math::sum(volume_m3_total) AS volume FROM clean_konsumsi_air GROUP ALL",
-        "biaya": "SELECT math::sum(amount_idr) AS total_cost, math::sum(budget_idr) AS total_budget FROM clean_biaya_operasional GROUP ALL",
-        "lembur": "SELECT math::sum(overtime_hours) AS hours, math::sum(overtime_cost_idr) AS cost FROM clean_lembur_staf GROUP ALL",
+        "pasien_total": f"SELECT count() AS total FROM clean_pasien_aktif{w_pasien} GROUP ALL",
+        "okupansi": f"SELECT math::sum(bed_capacity) AS capacity, math::sum(bed_occupied) AS occupied FROM clean_okupansi_kamar{w_occ} GROUP ALL",
+        "listrik": f"SELECT math::sum(kwh_total) AS kwh FROM clean_meter_listrik{w_listrik} GROUP ALL",
+        "air": f"SELECT math::sum(volume_m3_total) AS volume FROM clean_konsumsi_air{w_air} GROUP ALL",
+        "biaya": f"SELECT math::sum(amount_idr) AS total_cost, math::sum(budget_idr) AS total_budget FROM clean_biaya_operasional{w_biaya} GROUP ALL",
+        "lembur": f"SELECT math::sum(overtime_hours) AS hours, math::sum(overtime_cost_idr) AS cost FROM clean_lembur_staf{w_lembur} GROUP ALL",
     }
 
     async def _run_query(k: str, q: str) -> tuple[str, Any]:
@@ -850,7 +1029,6 @@ async def analytics_overview() -> dict[str, Any]:
             return k, {}
 
     tasks = [_run_query(k, q) for k, q in queries.items()]
-    import asyncio
     results = await asyncio.gather(*tasks)
     result = dict(results)
 
@@ -881,11 +1059,15 @@ async def analytics_overview() -> dict[str, Any]:
 
 
 @app.get("/mcp/analytics/cost-by-category")
-async def analytics_cost_by_category() -> dict[str, Any]:
+async def analytics_cost_by_category(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    w = _date_where("period_month", date_from, date_to)
     sql = (
-        "SELECT cost_category, math::sum(amount_idr) AS total_cost,"
-        " math::sum(budget_idr) AS total_budget"
-        " FROM clean_biaya_operasional GROUP BY cost_category"
+        f"SELECT cost_category, math::sum(amount_idr) AS total_cost,"
+        f" math::sum(budget_idr) AS total_budget"
+        f" FROM clean_biaya_operasional{w} GROUP BY cost_category"
     )
     try:
         records = await _query_surrealdb(sql)
@@ -895,11 +1077,15 @@ async def analytics_cost_by_category() -> dict[str, Any]:
 
 
 @app.get("/mcp/analytics/occupancy-by-unit")
-async def analytics_occupancy_by_unit() -> dict[str, Any]:
+async def analytics_occupancy_by_unit(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    w = _date_where("observed_at", date_from, date_to)
     sql = (
-        "SELECT unit_code, math::sum(bed_capacity) AS capacity,"
-        " math::sum(bed_occupied) AS occupied"
-        " FROM clean_okupansi_kamar GROUP BY unit_code"
+        f"SELECT unit_code, math::sum(bed_capacity) AS capacity,"
+        f" math::sum(bed_occupied) AS occupied"
+        f" FROM clean_okupansi_kamar{w} GROUP BY unit_code"
     )
     try:
         records = await _query_surrealdb(sql)
@@ -909,16 +1095,20 @@ async def analytics_occupancy_by_unit() -> dict[str, Any]:
 
 
 @app.get("/mcp/analytics/utility-trend")
-async def analytics_utility_trend() -> dict[str, Any]:
+async def analytics_utility_trend(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    w = _date_where("reading_at", date_from, date_to)
     try:
         listrik = await _query_surrealdb(
-            "SELECT unit_code, math::sum(kwh_total) AS kwh FROM clean_meter_listrik GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(kwh_total) AS kwh FROM clean_meter_listrik{w} GROUP BY unit_code"
         )
     except Exception:
         listrik = []
     try:
         air = await _query_surrealdb(
-            "SELECT unit_code, math::sum(volume_m3_total) AS volume FROM clean_konsumsi_air GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(volume_m3_total) AS volume FROM clean_konsumsi_air{w} GROUP BY unit_code"
         )
     except Exception:
         air = []
@@ -926,34 +1116,37 @@ async def analytics_utility_trend() -> dict[str, Any]:
 
 
 @app.get("/mcp/analytics/efficiency")
-async def analytics_efficiency() -> dict[str, Any]:
-    """Cost efficiency per unit: cost-per-service dan cost-to-revenue ratio.
+async def analytics_efficiency(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Cost efficiency per unit: cost-per-service dan cost-to-revenue ratio."""
+    w_biaya = _date_where("period_month", date_from, date_to)
+    w_kunjungan = _date_where("tanggal", date_from, date_to)
+    w_pendapatan = _date_where("period_month", date_from, date_to)
 
-    Menggabungkan raw_biaya_operasional (cost), raw_kunjungan_layanan (volume),
-    dan raw_pendapatan_unit (revenue) untuk menghasilkan metrik efisiensi per unit.
-    """
     try:
         cost_rows = await _query_surrealdb(
-            "SELECT unit_code, math::sum(amount_idr) AS total_cost"
-            " FROM clean_biaya_operasional GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(amount_idr) AS total_cost"
+            f" FROM clean_biaya_operasional{w_biaya} GROUP BY unit_code"
         )
     except Exception:
         cost_rows = []
 
     try:
         visit_rows = await _query_surrealdb(
-            "SELECT unit_code, math::sum(jumlah_kunjungan) AS total_kunjungan,"
-            " math::sum(jumlah_tindakan) AS total_tindakan"
-            " FROM clean_kunjungan_layanan GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(jumlah_kunjungan) AS total_kunjungan,"
+            f" math::sum(jumlah_tindakan) AS total_tindakan"
+            f" FROM clean_kunjungan_layanan{w_kunjungan} GROUP BY unit_code"
         )
     except Exception:
         visit_rows = []
 
     try:
         revenue_rows = await _query_surrealdb(
-            "SELECT unit_code, math::sum(amount_idr) AS total_revenue,"
-            " math::sum(target_idr) AS total_target"
-            " FROM clean_pendapatan_unit GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(amount_idr) AS total_revenue,"
+            f" math::sum(target_idr) AS total_target"
+            f" FROM clean_pendapatan_unit{w_pendapatan} GROUP BY unit_code"
         )
     except Exception:
         revenue_rows = []
@@ -992,28 +1185,30 @@ async def analytics_efficiency() -> dict[str, Any]:
 
 
 @app.get("/mcp/analytics/staffing")
-async def analytics_staffing() -> dict[str, Any]:
-    """Staffing optimization: shift coverage vs overtime per unit.
+async def analytics_staffing(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Staffing optimization: shift coverage vs overtime per unit."""
+    w_shift  = _date_where("shift_date", date_from, date_to)
+    w_lembur = _date_where("overtime_date", date_from, date_to)
 
-    Menggabungkan raw_jadwal_staf (shift reguler) dan raw_lembur_staf (overtime)
-    untuk mendeteksi unit yang overstaffed, understaffed, atau bergantung pada lembur.
-    """
     try:
         shift_rows = await _query_surrealdb(
-            "SELECT unit_code, math::sum(scheduled_hours) AS scheduled_hours,"
-            " math::sum(actual_hours) AS actual_hours,"
-            " count() AS total_shift,"
-            " math::sum(IF absent THEN 1 ELSE 0 END) AS total_absent"
-            " FROM clean_jadwal_staf GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(scheduled_hours) AS scheduled_hours,"
+            f" math::sum(actual_hours) AS actual_hours,"
+            f" count() AS total_shift,"
+            f" math::sum(IF absent THEN 1 ELSE 0 END) AS total_absent"
+            f" FROM clean_jadwal_staf{w_shift} GROUP BY unit_code"
         )
     except Exception:
         shift_rows = []
 
     try:
         overtime_rows = await _query_surrealdb(
-            "SELECT unit_code, math::sum(overtime_hours) AS overtime_hours,"
-            " math::sum(overtime_cost_idr) AS overtime_cost"
-            " FROM clean_lembur_staf GROUP BY unit_code"
+            f"SELECT unit_code, math::sum(overtime_hours) AS overtime_hours,"
+            f" math::sum(overtime_cost_idr) AS overtime_cost"
+            f" FROM clean_lembur_staf{w_lembur} GROUP BY unit_code"
         )
     except Exception:
         overtime_rows = []
@@ -1051,48 +1246,93 @@ async def analytics_staffing() -> dict[str, Any]:
     return {"units": units}
 
 
+@app.get("/mcp/analytics/daily-trend")
+async def analytics_daily_trend(year: int, month: int) -> dict[str, Any]:
+    """Agregat pasien aktif & lembur per hari dalam satu bulan (untuk kalender heatmap)."""
+    import calendar as _cal
+    last_day = _cal.monthrange(year, month)[1]
+    date_from = f"{year:04d}-{month:02d}-01"
+    date_to   = f"{year:04d}-{month:02d}-{last_day:02d}"
+
+    try:
+        pasien_rows = await _query_surrealdb(
+            f"SELECT string::slice(string(snapshot_at), 0, 10) AS day, count() AS total"
+            f" FROM clean_pasien_aktif"
+            f" WHERE snapshot_at >= '{date_from}T00:00:00Z'"
+            f" AND snapshot_at <= '{date_to}T23:59:59Z'"
+            f" GROUP BY day ORDER BY day"
+        )
+    except Exception:
+        pasien_rows = []
+
+    try:
+        lembur_rows = await _query_surrealdb(
+            f"SELECT string::slice(string(overtime_date), 0, 10) AS day,"
+            f" math::sum(overtime_hours) AS hours"
+            f" FROM clean_lembur_staf"
+            f" WHERE overtime_date >= '{date_from}T00:00:00Z'"
+            f" AND overtime_date <= '{date_to}T23:59:59Z'"
+            f" GROUP BY day ORDER BY day"
+        )
+    except Exception:
+        lembur_rows = []
+
+    pasien_map = {r["day"]: r.get("total", 0) for r in pasien_rows if "day" in r}
+    lembur_map = {r["day"]: r.get("hours", 0) for r in lembur_rows if "day" in r}
+
+    days: list[dict[str, Any]] = []
+    for d in range(1, last_day + 1):
+        day_str = f"{year:04d}-{month:02d}-{d:02d}"
+        days.append({
+            "date": day_str,
+            "pasien": pasien_map.get(day_str, 0),
+            "lembur_hours": lembur_map.get(day_str, 0),
+            "has_data": day_str in pasien_map or day_str in lembur_map,
+        })
+
+    return {"year": year, "month": month, "days": days}
+
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 
 
 @app.get("/mcp/summary/resource")
 async def summary_resource() -> dict[str, Any]:
     """Ringkasan utilitas resource (listrik, air, okupansi) per unit."""
-    try:
-        listrik_records = await _query_surrealdb(
-            "SELECT unit_code, meter_id, building_code, kwh_total, reading_at FROM clean_meter_listrik"
-        )
-    except Exception:
-        listrik_records = []
-    try:
-        air_records = await _query_surrealdb(
-            "SELECT unit_code, meter_id, volume_m3_total, reading_at FROM clean_konsumsi_air"
-        )
-    except Exception:
-        air_records = []
-    try:
-        okupansi_records = await _query_surrealdb(
-            "SELECT unit_code, room_class, bed_capacity, bed_occupied, room_status FROM clean_okupansi_kamar"
-        )
-    except Exception:
-        okupansi_records = []
+    async def _q(sql: str) -> list[dict[str, Any]]:
+        try:
+            return await _query_surrealdb(sql)
+        except Exception:
+            return []
+
+    listrik_rows, air_rows, occ_rows = await asyncio.gather(
+        _q("SELECT unit_code, math::sum(kwh_total) AS listrik_kwh"
+           " FROM clean_meter_listrik GROUP BY unit_code"),
+        _q("SELECT unit_code, math::sum(volume_m3_total) AS air_m3"
+           " FROM clean_konsumsi_air GROUP BY unit_code"),
+        _q("SELECT unit_code, math::sum(bed_capacity) AS bed_capacity,"
+           " math::sum(bed_occupied) AS bed_occupied"
+           " FROM clean_okupansi_kamar GROUP BY unit_code"),
+    )
 
     unit_map: dict[str, dict[str, Any]] = {}
+    _default = lambda u: {"unit_code": u, "listrik_kwh": 0, "air_m3": 0, "bed_occupied": 0, "bed_capacity": 0}
 
-    for record in listrik_records:
-        unit = record.get("unit_code", "unknown")
-        unit_map.setdefault(unit, {"unit_code": unit, "listrik_kwh": 0, "air_m3": 0, "bed_occupied": 0, "bed_capacity": 0})
-        unit_map[unit]["listrik_kwh"] += record.get("kwh_total", 0)
+    for r in listrik_rows:
+        u = r.get("unit_code", "unknown")
+        unit_map.setdefault(u, _default(u))
+        unit_map[u]["listrik_kwh"] = r.get("listrik_kwh") or 0
 
-    for record in air_records:
-        unit = record.get("unit_code", "unknown")
-        unit_map.setdefault(unit, {"unit_code": unit, "listrik_kwh": 0, "air_m3": 0, "bed_occupied": 0, "bed_capacity": 0})
-        unit_map[unit]["air_m3"] += record.get("volume_m3_total", 0)
+    for r in air_rows:
+        u = r.get("unit_code", "unknown")
+        unit_map.setdefault(u, _default(u))
+        unit_map[u]["air_m3"] = r.get("air_m3") or 0
 
-    for record in okupansi_records:
-        unit = record.get("unit_code", "unknown")
-        unit_map.setdefault(unit, {"unit_code": unit, "listrik_kwh": 0, "air_m3": 0, "bed_occupied": 0, "bed_capacity": 0})
-        unit_map[unit]["bed_occupied"] += record.get("bed_occupied", 0)
-        unit_map[unit]["bed_capacity"] += record.get("bed_capacity", 0)
+    for r in occ_rows:
+        u = r.get("unit_code", "unknown")
+        unit_map.setdefault(u, _default(u))
+        unit_map[u]["bed_occupied"] = r.get("bed_occupied") or 0
+        unit_map[u]["bed_capacity"] = r.get("bed_capacity") or 0
 
     return {"units": list(unit_map.values())}
 
@@ -1101,23 +1341,24 @@ async def summary_resource() -> dict[str, Any]:
 async def summary_cost() -> dict[str, Any]:
     """Ringkasan biaya operasional per unit & kategori."""
     try:
-        cost_records = await _query_surrealdb(
-            "SELECT unit_code, cost_category, amount_idr, budget_idr, period_month FROM clean_biaya_operasional"
+        agg_rows = await _query_surrealdb(
+            "SELECT unit_code, cost_category,"
+            " math::sum(amount_idr) AS amount_idr,"
+            " math::sum(budget_idr) AS budget_idr"
+            " FROM clean_biaya_operasional GROUP BY unit_code, cost_category"
         )
     except Exception:
-        cost_records = []
+        agg_rows = []
 
     unit_map: dict[str, dict[str, Any]] = {}
-    for record in cost_records:
-        unit = record.get("unit_code", "unknown")
+    for r in agg_rows:
+        unit = r.get("unit_code", "unknown")
         unit_map.setdefault(unit, {"unit_code": unit, "total_cost_idr": 0, "total_budget_idr": 0, "categories": {}})
-        cat = record.get("cost_category", "other")
-        amount = record.get("amount_idr", 0)
-        budget = record.get("budget_idr", 0)
+        cat = r.get("cost_category", "other")
+        amount = r.get("amount_idr") or 0
+        budget = r.get("budget_idr") or 0
         unit_map[unit]["total_cost_idr"] += amount
         unit_map[unit]["total_budget_idr"] += budget
-        unit_map[unit]["categories"].setdefault(cat, {"amount_idr": 0, "budget_idr": 0})
-        unit_map[unit]["categories"][cat]["amount_idr"] += amount
-        unit_map[unit]["categories"][cat]["budget_idr"] += budget
+        unit_map[unit]["categories"][cat] = {"amount_idr": amount, "budget_idr": budget}
 
     return {"units": list(unit_map.values())}

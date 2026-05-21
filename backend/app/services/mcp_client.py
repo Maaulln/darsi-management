@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -9,20 +10,25 @@ import httpx
 from app.core.config import settings
 
 
-def _get_db_ai_config() -> tuple[str, str]:
-    try:
-        from sqlalchemy import text
-        from app.services.postgres import engine
-        with engine.connect() as conn:
-            url = conn.execute(
-                text("SELECT value FROM darsi_settings WHERE key = 'ai_url'")
-            ).scalar()
-            model = conn.execute(
-                text("SELECT value FROM darsi_settings WHERE key = 'ai_model'")
-            ).scalar()
-            return url or "", model or ""
-    except Exception:
-        return "", ""
+async def _get_db_ai_config() -> tuple[str, str]:
+    def _sync_fetch() -> tuple[str, str]:
+        try:
+            from sqlalchemy import text
+            from app.services.postgres import engine
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT key, value FROM darsi_settings"
+                        " WHERE key IN ('ai_url', 'ai_model')"
+                    )
+                ).fetchall()
+                data = {row[0]: row[1] for row in rows}
+                return data.get("ai_url") or "", data.get("ai_model") or ""
+        except Exception:
+            return "", ""
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync_fetch)
 
 
 class MCPClient:
@@ -31,23 +37,30 @@ class MCPClient:
     def __init__(self, base_url: str | None = None, timeout: float = 15.0) -> None:
         self.base_url = (base_url or settings.mcp_server_url).rstrip("/")
         self.timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
     # ── Health ────────────────────────────────────────────────────────────────
 
-    def health(self) -> dict[str, str]:
+    async def health(self) -> dict[str, str]:
         """Periksa liveness MCP server."""
         try:
-            resp = httpx.get(f"{self.base_url}/health", timeout=self.timeout)
+            resp = await self._http.get(f"{self.base_url}/health")
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPError:
             return {"status": "down"}
 
-    def health_downstream(self) -> dict[str, object]:
+    async def health_downstream(self) -> dict[str, object]:
         """Periksa status semua downstream via MCP (SurrealDB, Ollama)."""
         try:
-            resp = httpx.get(
-                f"{self.base_url}/mcp/health/downstream", timeout=self.timeout
+            resp = await self._http.get(
+                f"{self.base_url}/mcp/health/downstream"
             )
             resp.raise_for_status()
             return resp.json()
@@ -56,22 +69,21 @@ class MCPClient:
 
     # ── Domains & Data ────────────────────────────────────────────────────────
 
-    def list_domains(self) -> dict[str, Any]:
+    async def list_domains(self) -> dict[str, Any]:
         """Daftar domain operasional dari MCP server."""
         try:
-            resp = httpx.get(f"{self.base_url}/mcp/domains", timeout=self.timeout)
+            resp = await self._http.get(f"{self.base_url}/mcp/domains")
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPError:
             return {"domains": []}
 
-    def fetch_domain_records(self, domain: str, limit: int = 50) -> dict[str, Any]:
+    async def fetch_domain_records(self, domain: str, limit: int = 50) -> dict[str, Any]:
         """Data clean satu domain dari MCP server."""
         try:
-            resp = httpx.get(
+            resp = await self._http.get(
                 f"{self.base_url}/mcp/data/{domain}",
                 params={"limit": limit},
-                timeout=self.timeout,
             )
             resp.raise_for_status()
             return resp.json()
@@ -80,7 +92,7 @@ class MCPClient:
 
     # ── Context ───────────────────────────────────────────────────────────────
 
-    def fetch_context(
+    async def fetch_context(
         self,
         query: str,
         n_results: int = 5,
@@ -91,10 +103,9 @@ class MCPClient:
         if domains:
             payload["domains"] = domains
         try:
-            resp = httpx.post(
+            resp = await self._http.post(
                 f"{self.base_url}/mcp/context",
                 json=payload,
-                timeout=self.timeout,
             )
             resp.raise_for_status()
             return resp.json()
@@ -109,14 +120,14 @@ class MCPClient:
 
     # ── Generate (RAG + LLM) ──────────────────────────────────────────────────
 
-    def generate(
+    async def generate(
         self,
         query: str,
         n_results: int = 5,
         use_rag: bool = True,
     ) -> dict[str, Any]:
         """RAG retrieval + LLM generation via MCP server (LangChain + Ollama)."""
-        url, model = _get_db_ai_config()
+        url, model = await _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
@@ -125,13 +136,13 @@ class MCPClient:
             "ai_model": model,
         }
         try:
-            resp = httpx.post(
-                f"{self.base_url}/mcp/generate",
-                json=payload,
-                timeout=180.0,
-            )
-            resp.raise_for_status()
-            return resp.json()
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(
+                    f"{self.base_url}/mcp/generate",
+                    json=payload,
+                )
+                resp.raise_for_status()
+                return resp.json()
         except httpx.HTTPError as error:
             return {
                 "query": query,
@@ -150,7 +161,7 @@ class MCPClient:
         use_rag: bool = True,
     ):
         """RAG + LLM streaming via MCP server — yield token chunks secara async."""
-        url, model = _get_db_ai_config()
+        url, model = await _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
@@ -168,12 +179,12 @@ class MCPClient:
 
     # ── Analytics ─────────────────────────────────────────────────────────────
 
-    def fetch_analytics(self, endpoint: str) -> dict[str, Any]:
+    async def fetch_analytics(self, endpoint: str, params: dict | None = None) -> dict[str, Any]:
         """Ambil data analytics dari MCP server (overview, cost-by-category, dll.)."""
         try:
-            resp = httpx.get(
+            resp = await self._http.get(
                 f"{self.base_url}/mcp/analytics/{endpoint}",
-                timeout=self.timeout,
+                params={k: v for k, v in (params or {}).items() if v is not None},
             )
             resp.raise_for_status()
             return resp.json()
@@ -182,12 +193,11 @@ class MCPClient:
 
     # ── Summary ───────────────────────────────────────────────────────────────
 
-    def fetch_summary(self, endpoint: str) -> dict[str, Any]:
+    async def fetch_summary(self, endpoint: str) -> dict[str, Any]:
         """Ambil data summary dari MCP server (resource, cost)."""
         try:
-            resp = httpx.get(
+            resp = await self._http.get(
                 f"{self.base_url}/mcp/summary/{endpoint}",
-                timeout=self.timeout,
             )
             resp.raise_for_status()
             return resp.json()

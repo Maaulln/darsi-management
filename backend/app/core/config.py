@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     app_port: int = 8000
 
     mcp_server_url: str = "http://mcp-server:8100"
+    cors_origins: str = "http://localhost:5173,http://localhost:80,http://localhost"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

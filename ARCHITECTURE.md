@@ -5,10 +5,13 @@
 DARSI Management menggunakan arsitektur **Layered Microservices** yang berjalan di atas private cloud (Docker). Setiap layer memiliki tanggung jawab yang terisolasi dan berkomunikasi melalui interface yang terdefinisi dengan baik. Pendekatan ini memastikan setiap komponen dapat dikembangkan, diuji, dan diganti secara independen.
 
 Pattern utama yang digunakan:
+
 - **Layered Architecture** — setiap layer hanya berkomunikasi dengan layer yang berdekatan
-- **RAG Pattern** — Retrieval-Augmented Generation via SurrealDB vector search (HNSW) untuk grounding output LLM dengan data operasional
+- **RAG Pattern** — Retrieval-Augmented Generation via SurrealDB HNSW vector search + BM25 full-text + RRF fusion + cross-encoder rerank untuk grounding output LLM dengan data operasional
 - **MCP Pattern** — Model Context Protocol sebagai mediator antara data layer dan AI layer
-- **Unified Data Store** — SurrealDB menggabungkan clean structured data dan vector store dalam satu service
+- **Unified Data Store** — SurrealDB menggabungkan clean structured data, vector store, dan BM25 index dalam satu service
+- **Fully Async I/O** — seluruh stack backend (FastAPI + MCPClient + MCP Server) menggunakan `async/await` dengan `httpx.AsyncClient` — tidak ada blocking call di event loop
+- **Multi-Layer Cache** — tiga level TTL cache (LLM response, vector retrieval, BM25 retrieval) meminimalkan latensi pada query berulang
 - **Human-in-the-Loop** — seluruh output AI bersifat advisory, bukan keputusan otomatis
 
 ---
@@ -38,7 +41,7 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 │  │  Vite + React 18     │    │  Direct DB query ke PostgreSQL   │    │
 │  └──────────┬───────────┘    └──────────────────────────────────┘    │
 └─────────────┼────────────────────────────────────────────────────────┘
-              │ HTTP
+              │ HTTP (1 batch request per dashboard load)
 ┌─────────────▼────────────────────────────────────────────────────────┐
 │  GATEWAY TIER                                                        │
 │  ┌──────────────────────────────────────────────────────────────┐   │
@@ -51,23 +54,26 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 │  APPLICATION TIER                                                    │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  [backend]  Port 8000                                        │   │
-│  │  FastAPI — thin REST layer, semua logika delegasi ke MCP     │   │
+│  │  FastAPI (fully async) — thin REST layer                     │   │
+│  │  MCPClient: lazy singleton httpx.AsyncClient                 │   │
 │  │  Endpoints: /api/analytics /api/chat /api/rag /api/summary   │   │
+│  │             /api/data /api/settings /health                  │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 └─────────────┬────────────────────────────────────────────────────────┘
-              │ HTTP
+              │ HTTP (async, shared client)
 ┌─────────────▼────────────────────────────────────────────────────────┐
 │  AI TIER                                                             │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  [mcp-server]  Port 8100                                     │   │
-│  │  Data Connector → Context Manager → LLM Generation           │   │
-│  │  Orchestrates: SurrealDB query + vector search + Ollama call │   │
+│  │  Data Connector → Context Manager → Optimised LLM Pipeline   │   │
+│  │  Shared httpx.AsyncClient + multi-layer in-memory cache      │   │
 │  └──────────┬───────────────────────────┬──────────────────────┘   │
-│             │ httpx                      │ LangChain LCEL            │
+│             │ httpx (shared client)      │ LangChain LCEL (ainvoke)  │
 │  ┌──────────▼───────────┐   ┌───────────▼──────────────────────┐   │
 │  │  [surrealdb] Port 8001│   │  [ollama]  Port 11434            │   │
 │  │  clean_* structured  │   │  qwen3.5:2b  — text generation   │   │
 │  │  + HNSW vector index │   │  nomic-embed-text — embedding    │   │
+│  │  + BM25 full-text    │   │                                  │   │
 │  └──────────────────────┘   └──────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────┘
 
@@ -86,7 +92,7 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 │                              │  POST /refine → Pandas cleaning    │  │
 │                              │  POST /sync   → write SurrealDB    │  │
 │                              │  POST /embed  → generate + store   │  │
-│                              │               vector (Ollama)       │  │
+│                              │         vector + BM25 (Ollama)     │  │
 │                              └────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -96,15 +102,15 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 | Service | Image / Base | Port | Tier | Tanggung Jawab Tunggal |
 |---|---|---|---|---|
 | `nginx` | nginx:1.27-alpine | 8080 | Gateway | Route traffic; single entry point |
-| `frontend` | node → nginx (multi-stage) | — | Presentation | React SPA: KPI dashboard, chat AI, summary |
+| `frontend` | node → nginx (multi-stage) | — | Presentation | React SPA: KPI dashboard, chat AI, summary, settings |
 | `metabase` | metabase/metabase | 3001 | Presentation | BI reporting via direct DB query |
-| `backend` | python:3.11 | 8000 | Application | REST API — proxy & translate request ke MCP Server |
-| `mcp-server` | python:3.11 | 8100 | AI | RAG pipeline: data retrieval + context assembly + LLM call |
+| `backend` | python:3.11 | 8000 | Application | Async REST API — proxy ke MCP Server via shared httpx.AsyncClient |
+| `mcp-server` | python:3.11 | 8100 | AI | RAG pipeline: retrieval + context assembly + optimised LLM call |
 | `ollama` | ollama/ollama | 11434 | AI | Local LLM inference (qwen3.5:2b + nomic-embed-text) |
-| `surrealdb` | surrealdb/surrealdb | 8001 | Data | Clean data store (`clean_*`) + HNSW vector index |
+| `surrealdb` | surrealdb/surrealdb | 8001 | Data | Clean data store (`clean_*`) + HNSW vector + BM25 full-text |
 | `pipeline-service` | python:3.11 | 8200 | Pipeline | Pandas ETL: raw → refined → clean + embed |
 | `n8n` | n8nio/n8n | 5678 | Pipeline | Cron orchestrator — HTTP trigger pipeline-service |
-| `postgres` | postgres:16 | 5432 | Data | Raw SIMRS data store (`raw_*`, 13 domain) |
+| `postgres` | postgres:16 | 5432 | Data | Raw SIMRS data store (`raw_*`, 13 domain) + settings persistence |
 | `simrs-simulator` | python:3.11 | — | Data | Real-time data generator ke PostgreSQL |
 
 ### Inter-Service Communication Matrix
@@ -114,11 +120,11 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 | React | Nginx | HTTP REST | Per user action | Semua request via single entry point |
 | Nginx | Backend | HTTP proxy | Per user action | Route `/api/*` |
 | Nginx | Frontend | Static serve | Per page load | SPA files |
-| Backend | MCP Server | HTTP REST | Per user action | Delegasi semua logika AI |
-| MCP Server | SurrealDB | httpx | Per AI request | Structured query + vector search |
-| MCP Server | Ollama | LangChain LCEL | Per AI request | Text generation (qwen3.5:2b) |
+| Backend | MCP Server | HTTP REST (async) | Per user action | Delegasi semua logika AI; shared httpx.AsyncClient |
+| MCP Server | SurrealDB | httpx (shared client) | Per AI request | Structured query + HNSW vector search + BM25 |
+| MCP Server | Ollama | LangChain LCEL (ainvoke) | Per AI request | Text generation (qwen3.5:2b) async |
 | Pipeline Service | Ollama | HTTP (Ollama API) | Setiap 1 menit | Embedding (nomic-embed-text) |
-| Pipeline Service | SurrealDB | httpx | Setiap 1 menit | Write `clean_*` + vector index |
+| Pipeline Service | SurrealDB | httpx | Setiap 1 menit | Write `clean_*` + vector index + BM25 |
 | Pipeline Service | PostgreSQL | SQLAlchemy | Setiap 1 menit | Read `raw_*`, write `refined_*` |
 | n8n | Pipeline Service | HTTP POST | Setiap 1 menit (cron) | Trigger `/refine` → `/sync` → `/embed` |
 | SIMRS Simulator | PostgreSQL | SQLAlchemy | Setiap 10 detik | Insert `raw_*` |
@@ -136,7 +142,10 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 ║   │      React Frontend     │   │    Metabase (Embedded)   │    ║
 ║   │  - Chat Interface       │   │  - Operational Charts    │    ║
 ║   │  - Dashboard UI         │   │  - Trend Visualization   │    ║
-║   │  - AI Summary Display   │   │  - Facility Usage Report │    ║
+║   │    (1 batch request,    │   │  - Facility Usage Report │    ║
+║   │     useMemo charts)     │   │                          │    ║
+║   │  - AI Summary Display   │   │                          │    ║
+║   │  - Settings / Superadmin│   │                          │    ║
 ║   └────────────┬────────────┘   └─────────────┬────────────┘    ║
 ╚════════════════│═════════════════════════════╗ │ ═══════════════╝
                  │ HTTP                        ║ │ Direct DB Query
@@ -156,48 +165,73 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 ║              ┌──────────────────────┐                          ║
 ║              │    FastAPI Backend   │                          ║
 ║              │      Port 8000       │                          ║
+║              │   (fully async)      │                          ║
 ║              │                      │                          ║
-║              │  - /api/analytics    │                          ║
-║              │  - /api/chat         │                          ║
-║              │  - /api/rag          │                          ║
-║              │  - /api/summary      │                          ║
+║              │  - GET /api/analytics/dashboard (batch: 6 metrics║
+║              │        di asyncio.gather, 1 response)           ║
+║              │  - GET /api/analytics/{metric}                  ║
+║              │  - POST /api/chat                               ║
+║              │  - POST /api/rag/query                          ║
+║              │  - GET /api/summary/*                           ║
+║              │  - GET/POST /api/settings/*                     ║
+║              │  - GET /health                                  ║
 ║              └──────────┬───────────┘                          ║
 ╚═════════════════════════│═══════════════════════════════════════╝
-                          │ HTTP
+                          │ HTTP (async, shared httpx.AsyncClient)
 ╔═════════════════════════▼═══════════════════════════════════════╗
 ║                        AI LAYER                                 ║
 ║                                                                 ║
 ║   ┌──────────────────────────────────────────────────────────┐  ║
 ║   │                    MCP Server (Port 8100)                │  ║
 ║   │                                                          │  ║
-║   │   Function 1: Data Connector                             │  ║
-║   │   SurrealDB ──► Structured Query ──► Aggregate Context   │  ║
+║   │   Fungsi 1 — Data Connector                              │  ║
+║   │   SurrealDB ──► math::sum() GROUP BY ──► Aggregate CTX  │  ║
+║   │   (3 parallel queries via asyncio.gather)                │  ║
 ║   │                                                          │  ║
-║   │   Function 2: Context Manager                            │  ║
-║   │   SurrealDB ──► Vector Search ──► Semantic Context       │  ║
+║   │   Fungsi 2 — Context Manager (Optimised RAG Pipeline)    │  ║
 ║   │                                                          │  ║
-║   │   Function 3: LLM Generation                             │  ║
-║   │   Context ──► LangChain Prompt ──► Ollama ──► Answer     │  ║
+║   │   ┌─ Parallel Embedding ─────────────────────────────┐   │  ║
+║   │   │  asyncio.create_task(HyDE embed)                 │   │  ║
+║   │   │  asyncio.create_task(direct embed)               │   │  ║
+║   │   │  wait_for(hyde, timeout=3s) or fallback direct   │   │  ║
+║   │   └──────────────────────────────────────────────────┘   │  ║
+║   │                                                          │  ║
+║   │   ┌─ Multi-Domain Retrieval (asyncio.gather) ────────┐   │  ║
+║   │   │  per domain: vec cache? → HNSW search            │   │  ║
+║   │   │              bm25 cache? → BM25 search           │   │  ║
+║   │   │              → RRF fusion                        │   │  ║
+║   │   └──────────────────────────────────────────────────┘   │  ║
+║   │                                                          │  ║
+║   │   Batch Cross-Encoder Rerank (1 ce.predict() call)       │  ║
+║   │   Context Assembly + Truncation (≤6000 chars)            │  ║
+║   │                                                          │  ║
+║   │   Fungsi 3 — Prompt Engineering (~80 token prefix)       │  ║
+║   │   context + query → PromptTemplate → Final Prompt        │  ║
+║   │                                                          │  ║
+║   │   Fungsi 4 — LLM Generation + Self-RAG                   │  ║
+║   │   chain.ainvoke() → LLM Response Cache check             │  ║
+║   │   if insufficient → retry top-5 ranked domains           │  ║
+║   │   (timeout 60s per retry, tidak semua 13 domain)         │  ║
 ║   └───────────┬──────────────────────────┬───────────────────┘  ║
 ║               │                          │                       ║
 ║   ┌───────────▼──────────┐  ┌────────────▼──────────────────┐   ║
 ║   │     LangChain        │  │   Ollama + qwen3.5:2b         │   ║
 ║   │   RAG Pipeline       │  │     Port 11434                │   ║
-║   │   (LCEL Chain)       │  │   Local LLM Inference         │   ║
+║   │   (LCEL Chain)       │  │   Local LLM (ainvoke async)   │   ║
 ║   └──────────────────────┘  └───────────────────────────────┘   ║
 ╚═════════════════════════════════════════════════════════════════╝
 
 ╔═════════════════════════════════════════════════════════════════╗
 ║                       DATA LAYER                                ║
 ║                                                                 ║
-║   ┌──────────────┐   ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ║
-║   │  PostgreSQL  │   │     n8n     │  │Pipeline Svc  │  │  SurrealDB   │  ║
-║   │  Port 5432   │   │ Port 5678   │  │  Port 8200   │  │  Port 8001   │  ║
-║   │              │   │             │  │              │  │              │  ║
-║   │  raw_* tables│   │ Cron 1 mnt  │  │ POST /refine │  │  clean_*     │  ║
-║   │  13 domain   │   │ HTTP trigger│─►│ POST /sync   │─►│  + Vector    │  ║
-║   └──────┬───────┘   └─────────────┘  │ POST /embed  │  │  Index HNSW  │  ║
-║          │◄──────────────────────────  └──────────────┘  └──────────────┘  ║
+║   ┌──────────────┐   ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ║
+║   │  PostgreSQL  │   │     n8n     │  │Pipeline Svc  │  │  SurrealDB  │  ║
+║   │  Port 5432   │   │ Port 5678   │  │  Port 8200   │  │  Port 8001  │  ║
+║   │              │   │             │  │              │  │             │  ║
+║   │  raw_* tables│   │ Cron 1 mnt  │  │ POST /refine │  │  clean_*    │  ║
+║   │  13 domain   │   │ HTTP trigger│─►│ POST /sync   │─►│  + HNSW     │  ║
+║   │  + settings  │   │             │  │ POST /embed  │  │  + BM25     │  ║
+║   └──────┬───────┘   └─────────────┘  └──────────────┘  └─────────────┘  ║
 ║          ▲                                                                  ║
 ║   ┌──────┴───────┐                                                          ║
 ║   │SIMRS Simulator│                                                         ║
@@ -216,11 +250,15 @@ DARSI terdiri dari **11 microservice** yang masing-masing berjalan sebagai konta
 Terdiri dari dua komponen yang bekerja bersama dalam satu tampilan:
 
 **React Frontend**
+
 Menangani semua interaksi pengguna yang bersifat dinamis dan AI-driven. Komponen utamanya meliputi chat interface untuk bertanya ke LLM (qwen3.5:2b via MCP Server), tampilan ringkasan analitik hasil AI, dan wrapper container untuk embed Metabase.
 
-Dashboard menampilkan **8 KPI card** (pasien aktif, BOR, total biaya, listrik, air, lembur, cost-to-revenue ratio, overtime ratio) dan **5 chart** (biaya per kategori, okupansi bed per unit, utilitas per unit, cost-to-revenue per unit, jam kerja vs lembur per unit). Dua KPI dan dua chart terakhir berasal dari endpoint analytics efisiensi yang hanya bisa dihitung setelah domain 9–13 tersedia.
+Dashboard menampilkan **8 KPI card** (pasien aktif, BOR, total biaya, listrik, air, lembur, cost-to-revenue ratio, overtime ratio) dan **5 chart** (biaya per kategori, okupansi bed per unit, utilitas per unit, cost-to-revenue per unit, jam kerja vs lembur per unit). Seluruh data dashboard diambil dalam **satu HTTP request** ke endpoint `/api/analytics/dashboard` yang mengembalikan 6 analytics sekaligus. Seluruh komputasi chart data di-memoize via `useMemo` untuk menghindari recompute berulang saat re-render.
+
+Halaman Settings (Superadmin) menyediakan konfigurasi dinamis API dan sistem — perubahan disimpan ke PostgreSQL dan dapat diterapkan tanpa restart layanan.
 
 **Metabase (Self-hosted, Port 3001)**
+
 Ditanamkan (embedded) ke dalam React melalui iframe menggunakan fitur Metabase Embedding. Metabase bertugas khusus untuk visualisasi data reporting — chart penggunaan fasilitas, tren layanan, konsumsi utilitas — dengan query langsung ke PostgreSQL dan SurrealDB.
 
 Pembagian tanggung jawab yang jelas:
@@ -232,6 +270,7 @@ Pembagian tanggung jawab yang jelas:
 ### 2. Gateway Layer
 
 **Nginx (Port 8080)**
+
 Bertindak sebagai single entry point untuk seluruh traffic. Melakukan routing berdasarkan path:
 
 ```
@@ -241,49 +280,84 @@ Bertindak sebagai single entry point untuk seluruh traffic. Melakukan routing be
 /n8n      → n8n UI (Port 5678)
 ```
 
-Selain routing, Nginx juga menangani SSL termination dan load balancing jika diperlukan di masa mendatang.
-
 ---
 
 ### 3. Application Layer
 
 **FastAPI Backend (Port 8000)**
-Menggunakan **Clean Architecture** dengan pembagian sebagai berikut:
+
+Menggunakan **Clean Architecture** dengan arsitektur fully async:
 
 ```
 backend/app/
-├── api/              # Route handlers
-│   ├── analytics.py  # GET /api/analytics/*
+├── api/
+│   ├── analytics.py  # GET /api/analytics/dashboard (batch 6-in-1)
+│   │                 # GET /api/analytics/{overview,cost-by-category,
+│   │                 #      occupancy-by-unit,utility-trend,efficiency,staffing}
 │   ├── chat.py       # POST /api/chat
 │   ├── rag.py        # POST /api/rag/query
 │   ├── summary.py    # GET /api/summary/*
 │   ├── data.py       # GET /api/data/*
+│   ├── settings.py   # GET/POST /api/settings/* (dynamic API management)
 │   └── health.py     # GET /health, /api/readiness
 ├── services/
-│   ├── mcp_client.py # HTTP client ke MCP Server
+│   ├── mcp_client.py # Async HTTP client — lazy singleton httpx.AsyncClient
 │   └── rag_service.py
 └── core/
-    └── config.py     # Settings (hanya mcp_server_url)
+    └── config.py     # Settings: mcp_server_url, cors_origins (dari env)
 ```
 
-FastAPI berkomunikasi ke AI Layer melalui HTTP request ke MCP Server. Tidak ada komunikasi langsung dari FastAPI ke database — semua akses data dikelola oleh MCP Server.
+**CORS** dikonfigurasi dari environment variable `CORS_ORIGINS` (CSV) bukan wildcard — menghindari kebocoran data lintas origin.
+
+**MCPClient** menggunakan lazy singleton `httpx.AsyncClient` yang dipakai ulang di seluruh request, menghindari overhead membuka koneksi baru per request:
+
+```python
+class MCPClient:
+    @property
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+```
+
+**Batch Dashboard Endpoint** menjalankan 6 analytics secara paralel via `asyncio.gather` dan mengembalikan satu response — mengurangi round-trip dari 6 menjadi 1:
+
+```python
+@router.get("/api/analytics/dashboard")
+async def get_dashboard(date_from=None, date_to=None):
+    results = await asyncio.gather(
+        mcp_client.fetch_analytics("overview", params),
+        mcp_client.fetch_analytics("cost-by-category", params),
+        mcp_client.fetch_analytics("occupancy-by-unit", params),
+        mcp_client.fetch_analytics("utility-trend", params),
+        mcp_client.fetch_analytics("efficiency", params),
+        mcp_client.fetch_analytics("staffing", params),
+        return_exceptions=True,
+    )
+    # error per-key, bukan raise — partial data tetap dikirim ke frontend
+```
+
+FastAPI tidak berkomunikasi langsung ke database — semua akses data dikelola oleh MCP Server.
 
 ---
 
 ### 4. AI Layer
 
-Ini adalah layer paling kritis dalam arsitektur DARSI. Terdiri dari tiga komponen yang bekerja secara berurutan.
+Layer paling kritis dalam arsitektur DARSI. MCP Server menjalankan empat fungsi dalam satu service.
 
 **MCP Server (Port 8100)**
 
-Memiliki tiga fungsi yang berjalan dalam satu service:
+#### Fungsi 1 — Data Connector
 
-*Fungsi 1 — Data Connector:*
-Melakukan structured query ke SurrealDB (`SELECT ... GROUP BY ...`) untuk mengambil data agregat operasional per domain — 13 domain mencakup pasien, okupansi, utilitas, biaya, farmasi, SDM, alat medis, kunjungan layanan, pendapatan, jadwal staf, downtime alat, dan tarif utilitas. Hasil query diformat menjadi konteks teks untuk RAG.
+Mengambil data agregat dari SurrealDB menggunakan `math::sum() GROUP BY` langsung di sisi database — tidak ada aggregasi Python di sisi aplikasi. Tiga query paralel via `asyncio.gather` untuk summary resource:
 
-Domain registry MCP Server memetakan setiap domain ke tiga properti: `surreal` (nama tabel `clean_*` di SurrealDB), `vector` (nama vector index HNSW), dan `keywords` (untuk intent detection pada query pengguna).
+```sql
+SELECT unit_code, math::sum(kwh_total) AS kwh, math::sum(biaya_listrik) AS biaya
+FROM clean_meter_listrik
+GROUP BY unit_code
+```
 
-Endpoint analytics yang tersedia:
+Endpoint analytics yang tersedia di MCP Server:
 
 | Endpoint | Fungsi |
 | --- | --- |
@@ -296,38 +370,144 @@ Endpoint analytics yang tersedia:
 | `GET /mcp/summary/resource` | Ringkasan utilitas resource per unit |
 | `GET /mcp/summary/cost` | Ringkasan biaya per unit & kategori |
 
-*Fungsi 2 — Context Manager:*
-Melakukan vector similarity search ke SurrealDB vector index (`vector::similarity::cosine`) berdasarkan query semantik pengguna. Menggabungkan hasil structured query dan semantic search menjadi satu konteks terstruktur yang siap dikonsumsi LLM.
+#### Fungsi 2 — Context Manager (Optimised RAG Pipeline)
 
-*Fungsi 3 — LLM Generation:*
-Menggunakan LangChain (LCEL: `PromptTemplate | OllamaLLM | StrOutputParser`) untuk memanggil Ollama dengan konteks yang sudah dikemas. Seluruh pipeline RAG — retrieval hingga generation — berjalan di dalam MCP Server.
+```
+Query Pengguna
+      │
+      ├─ [Intent Detection] → matched_domains (keyword overlap scoring)
+      │
+      ▼
+┌─────────────────────────────────────────────────────────┐
+│  Parallel Embedding Phase (asyncio.create_task × 2)     │
+│                                                         │
+│  Task A: HyDE Embedding                                 │
+│   generate_hypothetical_doc(query) → LLM draft text     │
+│   → nomic-embed-text → float[768]                       │
+│                                                         │
+│  Task B: Direct Embedding                               │
+│   query → nomic-embed-text → float[768]                 │
+│                                                         │
+│  Strategy: await direct_task (fast path)                │
+│  Then: wait_for(shield(hyde_task), timeout=3s)          │
+│  Use HyDE if ready; fallback to direct otherwise        │
+└─────────────────────┬───────────────────────────────────┘
+                      │ query_embedding (768-dim)
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│  Multi-Domain Retrieval (asyncio.gather per domain)     │
+│                                                         │
+│  For each matched domain:                               │
+│    vec_key  = "vec:{domain}:{md5(embedding)[:10]}"      │
+│    bm25_key = "bm25:{domain}:{md5(keywords)[:10]}"      │
+│                                                         │
+│    ├─ Cache HIT  → _noop(cached_value)                  │
+│    └─ Cache MISS → SurrealDB query                      │
+│                                                         │
+│    vector_docs  ← HNSW cosine similarity search         │
+│    bm25_docs    ← BM25 full-text search (expanded kws)  │
+│    fused_docs   ← RRF(vector_docs, bm25_docs)           │
+│                                                         │
+│    Cache set: vec_key → vector_docs (TTL 120s)          │
+│    Cache set: bm25_key → bm25_docs  (TTL 120s)          │
+└─────────────────────┬───────────────────────────────────┘
+                      │ all domain fused_docs
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│  Batch Cross-Encoder Rerank                             │
+│                                                         │
+│  Flatten all domain docs → single list                  │
+│  pairs = [(query, doc) for doc in all_docs]             │
+│  scores = ce.predict(pairs)   ← ONE call for all        │
+│  Group back per domain, keep top N                      │
+└─────────────────────┬───────────────────────────────────┘
+                      │ reranked docs per domain
+                      ▼
+           Context Assembly (join per domain)
+           _truncate_context(ctx, limit=6000 chars)
+```
 
-**LangChain (di dalam MCP Server)**
+**Reciprocal Rank Fusion (RRF):**
 
-Digunakan sebagai RAG framework untuk:
-1. Menyusun prompt dengan `PromptTemplate`
-2. Memanggil Ollama via `OllamaLLM`
-3. Mem-parse output LLM via `StrOutputParser`
+```
+score(doc) = Σ 1 / (k + rank(doc))   k=60 (default)
+```
 
-Vector retrieval dilakukan langsung ke SurrealDB menggunakan `vector::similarity::cosine` — tidak memerlukan vector database terpisah.
+Menggabungkan hasil vector search dan BM25 tanpa perlu threshold manual.
 
-**Ollama (Port 11434) — dua model**
+**BM25 Keyword Expansion:**
 
-Ollama berjalan sepenuhnya lokal di private cloud — tidak ada data yang keluar ke luar jaringan. Digunakan untuk dua fungsi berbeda:
+Semua matched domain berkontribusi keyword (bukan hanya 3 domain pertama — bug lama yang sudah diperbaiki). Total keyword di-cap di 12 kata.
 
-| Model | Fungsi | Ukuran |
-|---|---|---|
-| `qwen3.5:2b` | Generasi teks — chat, ringkasan, rekomendasi via LangChain | ~1.5 GB |
-| `nomic-embed-text` | Embedding teks → vector float[768] untuk RAG index | ~274 MB |
+#### Fungsi 3 — Prompt Engineering
 
-`qwen3.5:2b` dipanggil oleh LangChain di dalam MCP Server untuk generasi jawaban. `nomic-embed-text` dipanggil oleh `embed_to_surrealdb_vector.py` saat pipeline embed, dan oleh MCP Server saat query-time untuk menghasilkan embedding dari pertanyaan user.
+Template ringkas (~80 token prefix) yang terarah untuk model 2B:
+
+```
+Anda adalah analis data RS DARSI Surabaya.
+
+DATA OPERASIONAL:
+{context}
+
+PERTANYAAN: {query}
+
+Instruksi: Jawab singkat dan spesifik dalam Bahasa Indonesia.
+Gunakan HANYA data di atas. Sebutkan angka/fakta kunci.
+Jika data tidak cukup, nyatakan secara eksplisit.
+
+JAWABAN:
+```
+
+Dibandingkan template sebelumnya (~180 token) yang memaksa 3-step reasoning — template baru lebih cocok untuk model 2B yang cenderung confuse pada instruksi panjang.
+
+#### Fungsi 4 — LLM Generation + Self-RAG + Cache
+
+```
+Final Prompt
+      ↓
+llm_cache_key = "llm:{md5(query)[:10]}"
+cache hit? → return cached response immediately (~0ms)
+      ↓ cache miss
+chain.ainvoke({"context": ctx, "query": query})   ← async, timeout 120s
+      ↓
+answer = StrOutputParser output
+      ↓
+[Self-RAG Check]
+  if answer berisi "tidak ada data" / "tidak tersedia" / confidence rendah:
+    retry_domains = matched_domains + _rank_retry_domains(query, matched_domains)
+    # _rank_retry_domains: score unchecked domains by keyword overlap, top-5 only
+    # BUKAN semua 13 domain — mengurangi retry dari 60s → 20-25s
+    rebuild context → reinvoke LLM (asyncio.wait_for timeout=60s)
+      ↓
+_cache_set(llm_cache_key, response, TTL=60s)
+return GenerateResponse
+```
+
+**Shared SurrealDB HTTP Client:**
+
+Modul-level `_SURREAL_HTTP: httpx.AsyncClient` dibuat saat startup dan dipakai ulang seluruh request. Endpoint dan header di-precompute sebagai konstanta modul.
+
+**Cache Eviction Background Task:**
+
+```python
+async def _cache_evict_loop():
+    while True:
+        await asyncio.sleep(300)  # setiap 5 menit
+        expired = [k for k, (_, ts) in _CACHE.items() if (now - ts) > 600]
+        for k in expired: _CACHE.pop(k, None)
+```
 
 ---
 
 ### 5. Data Layer
 
 **PostgreSQL (Port 5432)**
-Menyimpan data mentah SIMRS dalam skema relasional (`raw_*` tables, 13 domain). Data terus-menerus diisi oleh SIMRS Simulator setiap 10 detik. Schema seluruh tabel tersedia dalam satu file: `pipeline/data/sql/raw_operational_schema.sql` (mencakup DDL + seed data statis tarif utilitas, cukup dieksekusi 1x).
+
+Menyimpan dua jenis data:
+1. **Raw SIMRS** — `raw_*` tables (13 domain), diisi terus-menerus oleh SIMRS Simulator setiap 10 detik
+2. **Settings Persistence** — konfigurasi sistem dan API management dari Superadmin dashboard
+
+Schema DDL tersedia di `pipeline/data/sql/raw_operational_schema.sql` (1x eksekusi, mencakup DDL + seed tarif utilitas).
 
 **Tabel raw_* — 13 Domain:**
 
@@ -350,32 +530,36 @@ Menyimpan data mentah SIMRS dalam skema relasional (`raw_*` tables, 13 domain). 
 Domain 1–8 menangani monitoring operasional harian. Domain 9–13 ditambahkan khusus untuk mengaktifkan kemampuan AI dalam menghitung metrik **resource optimization** (staffing ratio, equipment utilization) dan **cost efficiency** (cost-per-service, cost-to-revenue ratio, biaya utilitas aktual).
 
 **SIMRS Simulator (Docker service, no exposed port)**
-Service Python yang berjalan terus-menerus (`restart: unless-stopped`). Setiap 10 detik menginsert 1–100 record acak per domain ke tabel `raw_*` PostgreSQL — mensimulasikan aliran data real-time dari SIMRS rumah sakit.
+
+Service Python yang berjalan terus-menerus (`restart: unless-stopped`). Setiap 10 detik menginsert 1–100 record acak per domain ke tabel `raw_*` PostgreSQL.
 
 **n8n (Port 5678)**
+
 Mengorkestrasikan pipeline via HTTP trigger setiap 1 menit. Workflow linear:
 1. Cron trigger (setiap 1 menit)
-2. HTTP POST `pipeline-service/pipeline/refine` — jalankan Pandas refinement
-3. HTTP POST `pipeline-service/pipeline/sync` — sync ke SurrealDB
-4. HTTP POST `pipeline-service/pipeline/embed` — generate + simpan vector ke SurrealDB
+2. HTTP POST `pipeline-service/pipeline/refine`
+3. HTTP POST `pipeline-service/pipeline/sync`
+4. HTTP POST `pipeline-service/pipeline/embed`
 
-Dipilih karena pipeline linear tanpa dependensi kompleks — n8n cukup dan jauh lebih ringan dari Airflow. Tambahan: built-in notifikasi (email/Slack) saat pipeline gagal.
-
-Workflow sudah tersedia dalam format JSON di `n8n/darsi_pipeline_workflow.json` — siap import via UI n8n.
+Workflow tersedia di `n8n/darsi_pipeline_workflow.json` — siap import via UI n8n.
 
 **Pipeline Service (Port 8200)**
-FastAPI tipis yang mengekspos logika Pandas refinement sebagai HTTP endpoint. Dipanggil oleh n8n secara berurutan:
+
+FastAPI tipis yang mengekspos logika Pandas refinement sebagai HTTP endpoint:
+
 - `POST /pipeline/refine` — baca `raw_*` PostgreSQL → Pandas cleaning → tulis `refined_*`
 - `POST /pipeline/sync` — baca `refined_*` → tulis `clean_*` SurrealDB
-- `POST /pipeline/embed` — generate embedding dari `clean_*` → simpan ke SurrealDB vector index
-- `POST /pipeline/run-all` — jalankan ketiga step sekaligus (untuk trigger manual)
+- `POST /pipeline/embed` — generate embedding (nomic-embed-text via Ollama) → simpan ke SurrealDB vector + BM25 index
+- `POST /pipeline/run-all` — jalankan ketiga step sekaligus (trigger manual)
 
 **SurrealDB (Port 8001)**
-Menjadi **single source of truth** untuk seluruh AI Layer dengan dua peran:
-- **Clean Data Store** — tabel `clean_*` menyimpan data operasional terstruktur untuk structured query dan agregasi
-- **Vector Store** — vector index HNSW per domain menyimpan embedding untuk semantic search RAG
 
-Dipilih karena multi-model (document + relational + vector) sehingga menggantikan kebutuhan ChromaDB sebagai database terpisah.
+Single source of truth untuk seluruh AI Layer dengan tiga peran:
+- **Clean Data Store** — tabel `clean_*` untuk structured query dan agregasi (`math::sum() GROUP BY`)
+- **Vector Store** — HNSW vector index per domain (`vector::similarity::cosine`)
+- **Full-Text Store** — BM25 full-text index per domain (`search::score(1)`)
+
+Dipilih karena multi-model (document + relational + vector + full-text) — menggantikan kebutuhan ChromaDB sebagai database terpisah.
 
 ---
 
@@ -383,22 +567,45 @@ Dipilih karena multi-model (document + relational + vector) sehingga menggantika
 
 ```
 React ──────── HTTP/REST ────────► Nginx ──► FastAPI
-React ──────── iframe embed ─────► Metabase ──► PostgreSQL / SurrealDB (direct)
+React ──────── iframe embed ─────► Metabase ──► PostgreSQL (direct)
 
-FastAPI ─────── HTTP/REST ────────► MCP Server
-MCP Server ──── httpx ────────────► SurrealDB (structured query)
-MCP Server ──── httpx ────────────► SurrealDB (vector similarity search)
-MCP Server ──── LangChain LCEL ───► Ollama (qwen3.5:2b)
+FastAPI ─────── HTTP/REST (async) ─► MCP Server (shared httpx.AsyncClient)
+MCP Server ──── httpx (shared) ───► SurrealDB (structured query)
+MCP Server ──── httpx (shared) ───► SurrealDB (HNSW vector + BM25 search)
+MCP Server ──── LangChain LCEL ───► Ollama (qwen3.5:2b, ainvoke)
 
 SIMRS Simulator ── SQLAlchemy ────► PostgreSQL (setiap 10 detik)
 
 n8n ────────────── HTTP POST ──────► Pipeline Service (setiap 1 menit)
 Pipeline Service ─ SQLAlchemy ────► PostgreSQL (read raw_*, write refined_*)
 Pipeline Service ─ Pandas ─────────► Data Refinement
-Pipeline Service ─ httpx ──────────► SurrealDB (write clean_* + vector index)
+Pipeline Service ─ httpx ──────────► SurrealDB (write clean_* + vector + BM25)
 ```
 
-Semua komunikasi antar service berjalan di dalam Docker network internal. Hanya Nginx (8080), n8n (5678), dan Metabase (3001) yang diekspos ke luar untuk keperluan akses pengguna.
+Semua komunikasi antar service berjalan di dalam Docker network internal. Hanya Nginx (8080), n8n (5678), dan Metabase (3001) yang diekspos ke luar.
+
+---
+
+## Multi-Layer Cache Architecture
+
+Cache diimplementasikan sebagai in-memory dict `_CACHE: dict[str, tuple[Any, float]]` di dalam proses MCP Server. Tidak memerlukan Redis karena volume traffic satu instance.
+
+| Layer | Key Pattern | TTL | Scope | Penghematan |
+|---|---|---|---|---|
+| LLM Response | `llm:{md5(query)[:10]}` | 60 detik | Seluruh pipeline | 30–120s → ~0ms (query sama) |
+| Vector Results | `vec:{domain}:{md5(embed)[:10]}` | 120 detik | Per domain per query | 500ms–3s per domain |
+| BM25 Results | `bm25:{domain}:{md5(kws)[:10]}` | 120 detik | Per domain per keyword set | 200ms–1s per domain |
+
+Background task `_cache_evict_loop()` membersihkan entri yang berumur >600 detik setiap 5 menit.
+
+Perkiraan latensi setelah optimasi:
+
+| Skenario | Sebelum | Sesudah |
+|---|---|---|
+| Query sama (< 60s) | 30–120s | ~0ms (LLM cache hit) |
+| Query baru, retrieval cache warm | 35–130s | 5–15s |
+| Query baru, cold cache | 35–130s | 15–25s |
+| Self-RAG retry triggered | +60–120s tambahan | +20–40s tambahan |
 
 ---
 
@@ -407,13 +614,23 @@ Semua komunikasi antar service berjalan di dalam Docker network internal. Hanya 
 | Keputusan | Alasan |
 |---|---|
 | Self-hosted semua service | Data RS bersifat sensitif, tidak boleh keluar ke cloud publik |
-| qwen3.5:2b sebagai LLM generasi | Model ringan (2B parameter) yang cukup untuk ringkasan analitik; berjalan lokal, data tidak keluar jaringan |
-| nomic-embed-text sebagai embedding | Model khusus embedding (768 dim) via Ollama — lebih efisien dan akurat dibanding memakai model generatif untuk embedding |
-| SurrealDB sebagai clean data + vector store | Multi-model (relational + vector HNSW) — menggantikan kebutuhan ChromaDB terpisah, satu service lebih sedikit |
-| MCP Server sebagai mediator | Sentralisasi logika structured query + vector search + LLM generation; backend tetap thin REST layer |
+| qwen3.5:2b sebagai LLM generasi | Model ringan (2B parameter) yang cukup untuk ringkasan analitik; berjalan lokal |
+| nomic-embed-text sebagai embedding | Model khusus embedding (768 dim) via Ollama — lebih efisien dan akurat |
+| SurrealDB sebagai clean data + vector + BM25 | Multi-model — menggantikan kebutuhan ChromaDB dan Elasticsearch terpisah |
+| MCP Server sebagai mediator | Sentralisasi RAG pipeline; backend tetap thin REST layer |
+| Fully async I/O | Menghindari blocking event loop — critical untuk throughput tinggi dengan model LLM yang lambat |
+| Shared httpx.AsyncClient | Menghindari overhead pembuatan koneksi baru per request |
+| Batch dashboard endpoint | Satu round-trip menggantikan 6 — mengurangi latensi dashboard load signifikan |
+| Parallel HyDE + direct embedding | Mengurangi bottleneck embedding dari 4–11s sequential menjadi 3–6s paralel |
+| Batch cross-encoder rerank | Satu ce.predict() call untuk semua domain — lebih efisien dari N serial calls |
+| In-memory TTL cache | Cukup untuk satu instance; tanpa overhead Redis untuk prototype ini |
+| CORS dari environment variable | Hindari wildcard `*` pada credentials; konfigurasi per environment |
+| Smarter Self-RAG (top-5 ranked) | Retry ke 13 domain memakan 60–120s; scoring keyword memilih 5 domain paling relevan |
+| Context truncation (6000 chars) | Model 2B optimal dengan context ≤1500 token — melebihi ini menurunkan akurasi |
+| Prompt template ringkas (~80 token) | Model kecil lebih baik dengan instruksi singkat dan tegas |
 | SIMRS Simulator sebagai service tersendiri | Data mengalir real-time setiap 10 detik, terpisah dari pipeline refinement |
-| n8n menggantikan Airflow | Pipeline linear tanpa dependensi kompleks — Airflow overkill; n8n lebih ringan, built-in notifikasi |
-| Pipeline Service sebagai HTTP service | n8n tidak bisa eksekusi Python langsung; memisahkan logika Pandas ke service tersendiri yang bisa dipanggil via HTTP |
+| n8n menggantikan Airflow | Pipeline linear tanpa dependensi kompleks — n8n lebih ringan, built-in notifikasi |
+| Pipeline Service sebagai HTTP service | n8n tidak bisa eksekusi Python langsung; memisahkan logika Pandas ke service HTTP |
 | Metabase embedded di React | Metabase unggul untuk reporting, React untuk komponen AI-driven |
 | Human-in-the-Loop | Seluruh output AI bersifat advisory, validasi tetap di tangan pengguna |
 | RAG bukan fine-tuning | Data operasional RS berubah periodik, RAG lebih adaptif tanpa perlu retrain model |
@@ -421,8 +638,6 @@ Semua komunikasi antar service berjalan di dalam Docker network internal. Hanya 
 ---
 
 ## Alur Metodologi Penelitian (Tahap 1–4)
-
-Bagian ini memetakan tahapan penelitian ke implementasi teknis, sekaligus mengoreksi posisi **Strategi Prompt Engineering** yang sering keliru ditempatkan paralel dengan RAG. Prompt Engineering bekerja **setelah** retrieval RAG, bukan setara dengannya.
 
 ### Tahap 1 — Integrasi dan Persiapan Data Operasional
 
@@ -433,9 +648,9 @@ Metadata Operasional SIMRS (PostgreSQL raw_*)
     ↓
 [Pipeline Service] Sync → SurrealDB clean_*
     ↓
-[Pipeline Service] Embed → SurrealDB vector index (HNSW)
+[Pipeline Service] Embed → SurrealDB vector HNSW + BM25 index
     ↓
-Data Operasional Terstruktur (SurrealDB clean_* + vector)
+Data Operasional Terstruktur (SurrealDB clean_* + vector + BM25)
 ```
 
 Orkestrasi oleh n8n (cron 1 menit): `/refine` → `/sync` → `/embed`.
@@ -444,7 +659,7 @@ Orkestrasi oleh n8n (cron 1 menit): `/refine` → `/sync` → `/embed`.
 
 ### Tahap 2 — Pengembangan Modul Analitik Berbasis AI
 
-Ini adalah tahap yang paling sering disalah-gambarkan. Alur yang benar di dalam **MCP Server**:
+Alur yang benar di dalam **MCP Server** (setelah optimasi):
 
 ```
 Query Pengguna
@@ -454,45 +669,41 @@ Query Pengguna
 │                    MCP Server (Port 8100)                     │
 │                                                               │
 │  Fungsi 1 — Data Connector                                    │
-│  SurrealDB clean_* → Structured Query (GROUP BY) → Konteks   │
+│  SurrealDB clean_* → math::sum() GROUP BY → Aggregate Context │
+│  (3 parallel queries via asyncio.gather)                      │
 │                                        │                      │
-│  Fungsi 2 — Context Manager (Arsitektur RAG)                 │
-│  Query → Embedding (nomic-embed-text)                         │
-│        → Vector Search SurrealDB (cosine similarity)         │
-│        → Semantic Context                                     │
+│  Fungsi 2 — Context Manager (Arsitektur RAG Teroptimasi)     │
+│  Query → Parallel Embed (HyDE + Direct, asyncio.create_task)  │
+│        → Multi-domain HNSW + BM25 (asyncio.gather, cached)   │
+│        → RRF Fusion per domain                                │
+│        → Batch Cross-Encoder Rerank (1 ce.predict() call)     │
+│        → Context Assembly + Truncation (≤6000 chars)          │
 │                                        │                      │
 │                               ─────────┘                      │
 │                               ↓                               │
-│  Fungsi 3 — Strategi Prompt Engineering                       │
+│  Fungsi 3 — Strategi Prompt Engineering (~80 token)           │
 │  context (structured + semantic) + query                      │
 │        → PromptTemplate.format(context=..., query=...)        │
 │        → Final Prompt                                         │
 │                               ↓                               │
-│  Fungsi 4 — LLM Generation (via LangChain LCEL)              │
-│  Final Prompt → OllamaLLM (qwen3.5:2b) → StrOutputParser     │
+│  Fungsi 4 — LLM Generation + Self-RAG + Cache                │
+│  LLM Cache check → chain.ainvoke() → StrOutputParser          │
+│  Self-RAG: if insufficient → retry top-5 ranked domains       │
+│  Cache set: llm_cache_key (TTL 60s)                           │
 │                               ↓                               │
 │                         Jawaban / Insight                     │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-**Aturan posisi Prompt Engineering:**
+**Posisi komponen dalam pipeline:**
 
 | Komponen | Posisi dalam Pipeline | Hubungan |
 |---|---|---|
-| Arsitektur RAG | Sebelum Prompt Engineering | Output RAG (context) → masuk ke Prompt |
-| Strategi Prompt Engineering | Setelah RAG, sebelum LLM | Merakit context + query → final prompt |
-| MCP Server | Container semua komponen | Bukan hanya "protocol", tapi service lengkap |
-
-**Yang salah (jangan gambarkan seperti ini):**
-```
-AI Module ↔ MCP ↔ RAG          ← MCP dan Prompt Engineering paralel
-AI Module ↔ Prompt Eng ↔ RAG   ← Prompt Engineering berinteraksi langsung dgn RAG
-```
-
-**Yang benar:**
-```
-RAG retrieval → Prompt Engineering → LLM   ← sequential, satu arah
-```
+| Data Connector | Pertama — structured aggregate | Output → masuk ke context builder |
+| Arsitektur RAG | Kedua — semantic retrieval | Output (context) → masuk ke Prompt |
+| Strategi Prompt Engineering | Ketiga — setelah RAG | Merakit context + query → final prompt |
+| LLM Generation | Keempat — setelah Prompt | Final Prompt → model → answer |
+| Self-RAG | Post-generation check | Trigger retry jika jawaban tidak cukup |
 
 ---
 
@@ -501,9 +712,9 @@ RAG retrieval → Prompt Engineering → LLM   ← sequential, satu arah
 ```
 Hasil Analisis AI (MCP Server output)
     ↓
-FastAPI Backend → React Frontend
+FastAPI Backend (async) → React Frontend
     ↓
-Dashboard Interaktif (8 KPI card + 5 chart)
+Dashboard Interaktif (8 KPI card + 5 chart, 1 batch request)
     + Metabase embedded (reporting BI)
     ↓
 Insight Operasional

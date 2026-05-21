@@ -35,7 +35,7 @@ async def list_data() -> dict[str, list[dict[str, str]]]:
 @router.get("/domains")
 async def list_domains() -> dict[str, Any]:
     """Daftar domain clean yang tersedia di MCP server."""
-    return mcp_client.list_domains()
+    return await mcp_client.list_domains()
 
 
 @router.get("/domain/{domain}")
@@ -46,7 +46,7 @@ async def get_domain_data(domain: str, limit: int = 50) -> dict[str, Any]:
         domain: Nama domain (mis. okupansi_kamar, biaya_operasional).
         limit: Jumlah record maksimal.
     """
-    payload = mcp_client.fetch_domain_records(domain, limit=limit)
+    payload = await mcp_client.fetch_domain_records(domain, limit=limit)
     if payload.get("error"):
         raise HTTPException(status_code=502, detail=payload["error"])
     return payload
