@@ -80,6 +80,89 @@ def _cache_set(key: str, value: Any) -> None:
     _CACHE[key] = (value, time.monotonic())
 
 
+# ─── Provider Detection ───────────────────────────────────────────────────────
+
+def _is_gemini(url: str | None) -> bool:
+    return bool(url and "googleapis.com" in url)
+
+
+# ─── Gemini Runnable ──────────────────────────────────────────────────────────
+
+class _GeminiRunnable:
+    """LangChain-compatible wrapper untuk Google Gemini generateContent API."""
+
+    _BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+    def __init__(self, api_key: str, model: str, prompt_template: Any = None) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._tmpl = prompt_template
+
+    def _render(self, input_data: dict) -> str:
+        if self._tmpl is not None:
+            return self._tmpl.format(**input_data)
+        return input_data.get("query", str(input_data))
+
+    _RETRY_STATUSES = {429, 500, 503}
+
+    def _post_sync(self, prompt_text: str) -> str:
+        url = f"{self._BASE}/models/{self._model}:generateContent"
+        for attempt in range(3):
+            if attempt > 0:
+                import time
+                wait = 2 ** (attempt - 1)
+                print(f"[WARN] Gemini retry {attempt}/2 in {wait}s")
+                time.sleep(wait)
+            try:
+                with httpx.Client(timeout=120) as client:
+                    resp = client.post(
+                        url,
+                        headers={"x-goog-api-key": self._api_key, "Content-Type": "application/json"},
+                        json={"contents": [{"parts": [{"text": prompt_text}]}]},
+                    )
+                    resp.raise_for_status()
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in self._RETRY_STATUSES and attempt < 2:
+                    continue
+                raise
+        raise RuntimeError("Gemini: max retries exceeded")
+
+    async def _post_async(self, prompt_text: str) -> str:
+        url = f"{self._BASE}/models/{self._model}:generateContent"
+        for attempt in range(3):
+            if attempt > 0:
+                wait = 2 ** (attempt - 1)
+                print(f"[WARN] Gemini retry {attempt}/2 in {wait}s")
+                await asyncio.sleep(wait)
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        url,
+                        headers={"x-goog-api-key": self._api_key, "Content-Type": "application/json"},
+                        json={"contents": [{"parts": [{"text": prompt_text}]}]},
+                    )
+                    resp.raise_for_status()
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in self._RETRY_STATUSES and attempt < 2:
+                    continue
+                raise
+        raise RuntimeError("Gemini: max retries exceeded")
+
+    def invoke(self, input_data: dict) -> str:
+        return self._post_sync(self._render(input_data))
+
+    async def ainvoke(self, input_data: dict) -> str:
+        return await self._post_async(self._render(input_data))
+
+    async def astream(self, input_data: dict):
+        text = await self._post_async(self._render(input_data))
+        chunk_size = 12
+        for i in range(0, len(text), chunk_size):
+            yield text[i : i + chunk_size]
+
+
 # ─── LLM Singleton Pool ───────────────────────────────────────────────────────
 # OllamaLLM diinstansiasi sekali per (url, model) dan di-reuse antar request.
 
@@ -152,28 +235,28 @@ _HYDE_PROMPT = PromptTemplate.from_template(
 )
 
 
-async def _get_ai_config() -> tuple[str, str]:
+async def _get_ai_config() -> tuple[str, str, str | None]:
     cached = _cache_get("ai_config", _TTL_AI_CONFIG)
     if cached is not None:
         return cached
     url = OLLAMA_BASE_URL
     model = OLLAMA_MODEL
+    api_key: str | None = None
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get("http://backend:8000/api/settings/ai")
+            r = await client.get("http://backend:8000/api/settings/ai-models/active")
             if r.status_code == 200:
                 data = r.json()
-                if data.get("url"):
-                    u = data["url"].strip()
-                    if u.endswith("/"): u = u[:-1]
-                    if u.endswith("/api/generate"): u = u[:-13]
-                    elif u.endswith("/api/embeddings"): u = u[:-15]
-                    if u.endswith("/"): u = u[:-1]
-                    url = u
-                if data.get("model"): model = data["model"]
+                m = data.get("model") or {}
+                if m.get("api_url"):
+                    url = m["api_url"].strip().rstrip("/")
+                if m.get("model_name"):
+                    model = m["model_name"]
+                if m.get("api_key"):
+                    api_key = m["api_key"]
     except Exception:
         pass
-    result = (url, model)
+    result = (url, model, api_key)
     _cache_set("ai_config", result)
     return result
 
@@ -182,23 +265,23 @@ async def _build_chain(
     has_context: bool = True,
     ai_url: str | None = None,
     ai_model: str | None = None,
+    ai_key: str | None = None,
 ):
     url = ai_url
     model = ai_model
+    key = ai_key
     if not url or not model:
-        db_url, db_model = await _get_ai_config()
+        db_url, db_model, db_key = await _get_ai_config()
         if not url: url = db_url
         if not model: model = db_model
+        if key is None: key = db_key
+
+    prompt = _PROMPT_TEMPLATE if has_context else PromptTemplate.from_template("{query}")
+
+    if _is_gemini(url) and key:
+        return _GeminiRunnable(api_key=key, model=model, prompt_template=prompt)
 
     llm = _get_llm(url, model)
-
-    if has_context:
-        prompt = _PROMPT_TEMPLATE
-    else:
-        # Prompt super minimal untuk query non-operasional/sapaan
-        # Ini menghemat prompt-prefill token secara drastis pada CPU Ollama lambat
-        prompt = PromptTemplate.from_template("{query}")
-
     return prompt | llm | StrOutputParser()
 
 
@@ -308,6 +391,7 @@ class GenerateRequest(BaseModel):
     use_rag: bool = True
     ai_url: str | None = None
     ai_model: str | None = None
+    ai_key: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -349,13 +433,26 @@ async def _query_surrealdb(sql: str) -> list[dict[str, Any]]:
     return []
 
 
-async def _get_query_embedding(text: str, ai_url: str | None = None) -> list[float]:
-    """Generate embedding vector untuk query teks via Ollama."""
+async def _get_query_embedding(text: str, ai_url: str | None = None, ai_key: str | None = None) -> list[float]:
+    """Generate embedding vector untuk query teks via Ollama atau Gemini."""
     url = ai_url
+    key = ai_key
     if not url:
-        db_url, _ = await _get_ai_config()
+        db_url, _, db_key = await _get_ai_config()
         url = db_url
-    # Menggunakan timeout 5 detik agar gagal cepat jika server remote lambat/tidak punya model embedding
+        if key is None:
+            key = db_key
+
+    if _is_gemini(url) and key:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent",
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json={"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}},
+            )
+            resp.raise_for_status()
+            return resp.json()["embedding"]["values"]
+
     async with httpx.AsyncClient(timeout=5) as client:
         resp = await client.post(
             f"{url}/api/embeddings",
@@ -467,7 +564,7 @@ def _detect_intent(query: str) -> list[str]:
 
 
 async def _generate_hypothetical_doc(
-    query: str, ai_url: str | None = None, ai_model: str | None = None
+    query: str, ai_url: str | None = None, ai_model: str | None = None, ai_key: str | None = None
 ) -> str:
     """HyDE: generate jawaban hipotetis singkat lalu embed hasilnya untuk retrieval.
 
@@ -481,16 +578,22 @@ async def _generate_hypothetical_doc(
 
     url = ai_url
     model = ai_model
+    key = ai_key
     if not url or not model:
-        url, model = await _get_ai_config()
+        db_url, db_model, db_key = await _get_ai_config()
+        if not url: url = db_url
+        if not model: model = db_model
+        if key is None: key = db_key
 
     try:
-        llm = _get_llm(url, model)
-        chain = _HYDE_PROMPT | llm | StrOutputParser()
+        if _is_gemini(url) and key:
+            chain = _GeminiRunnable(api_key=key, model=model, prompt_template=_HYDE_PROMPT)
+        else:
+            chain = _HYDE_PROMPT | _get_llm(url, model) | StrOutputParser()
         hyp = await asyncio.wait_for(chain.ainvoke({"query": query}), timeout=6.0)
         result = hyp.strip() or query
     except Exception:
-        result = query  # fallback ke query asli agar retrieval tetap berjalan
+        result = query
 
     _cache_set(cache_key, result)
     return result
@@ -550,21 +653,15 @@ async def _fetch_single_domain(
 
 
 async def _build_rag_context(
-    query: str, n_results: int, target_domains: list[str], ai_url: str | None = None
+    query: str, n_results: int, target_domains: list[str], ai_url: str | None = None, ai_key: str | None = None
 ) -> tuple[str, int, int]:
-    """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan.
-
-    Embedding di-cache per query string. Semua domain di-fetch secara concurrent
-    dengan asyncio.gather sehingga latency tidak bertambah linear dengan jumlah domain.
-    """
-    # HyDE: embed hypothetical document, bukan query mentah.
-    # Cache gabungan hyde+embed agar kedua langkah tidak diulang untuk query yang sama.
+    """Susun konteks dari SurrealDB vector + structured untuk domain yang ditargetkan."""
     embed_key = f"emb:{query}"
     query_embedding: list[float] | None = _cache_get(embed_key, _TTL_EMBEDDING)
     if query_embedding is None:
-        hyde_text = await _generate_hypothetical_doc(query, ai_url=ai_url)
+        hyde_text = await _generate_hypothetical_doc(query, ai_url=ai_url, ai_key=ai_key)
         try:
-            query_embedding = await _get_query_embedding(hyde_text, ai_url=ai_url)
+            query_embedding = await _get_query_embedding(hyde_text, ai_url=ai_url, ai_key=ai_key)
             _cache_set(embed_key, query_embedding)
         except Exception as e:
             print(f"[WARN] Gagal mengambil embedding query: {e}")
@@ -730,18 +827,19 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
 
         if target_domains:
             context, vector_hits, surreal_hits = await _build_rag_context(
-                query, payload.n_results, target_domains, ai_url=payload.ai_url
+                query, payload.n_results, target_domains, ai_url=payload.ai_url, ai_key=payload.ai_key
             )
             if not context:
                 context = "Tidak ada data operasional yang relevan ditemukan."
-            source = "surrealdb_vector+structured+ollama"
+            source = "surrealdb_vector+structured+llm"
 
     try:
         has_real_context = bool(context and context != "(no context)" and "Tidak ada data operasional" not in context)
         chain = await _build_chain(
             has_context=has_real_context,
             ai_url=payload.ai_url,
-            ai_model=payload.ai_model
+            ai_model=payload.ai_model,
+            ai_key=payload.ai_key,
         )
 
         if has_real_context:
@@ -749,8 +847,6 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
         else:
             answer = chain.invoke({"query": query})
 
-        # Self-RAG: jika jawaban mengindikasikan data tidak cukup dan masih ada
-        # domain yang belum dicari, retry sekali dengan seluruh domain.
         if (
             payload.use_rag
             and _is_insufficient(answer)
@@ -758,18 +854,19 @@ async def generate(payload: GenerateRequest) -> GenerateResponse:
         ):
             all_domains = list(DOMAINS.keys())
             retry_context, rv, rs = await _build_rag_context(
-                query, payload.n_results, all_domains, ai_url=payload.ai_url
+                query, payload.n_results, all_domains, ai_url=payload.ai_url, ai_key=payload.ai_key
             )
             if retry_context and "Tidak ada data" not in retry_context:
                 retry_chain = await _build_chain(
                     has_context=True,
                     ai_url=payload.ai_url,
                     ai_model=payload.ai_model,
+                    ai_key=payload.ai_key,
                 )
                 answer = retry_chain.invoke({"context": retry_context, "query": query})
                 context, vector_hits, surreal_hits = retry_context, rv, rs
                 matched_domains = all_domains
-                source = "surrealdb_self_rag_retry+ollama"
+                source = "surrealdb_self_rag_retry+llm"
 
     except Exception as error:
         import traceback
@@ -807,7 +904,7 @@ async def generate_stream(payload: GenerateRequest) -> StreamingResponse:
         matched_domains = target_domains
         if target_domains:
             context, _, _ = await _build_rag_context(
-                query, payload.n_results, target_domains, ai_url=payload.ai_url
+                query, payload.n_results, target_domains, ai_url=payload.ai_url, ai_key=payload.ai_key
             )
 
     has_real_context = bool(
@@ -817,12 +914,17 @@ async def generate_stream(payload: GenerateRequest) -> StreamingResponse:
         has_context=has_real_context,
         ai_url=payload.ai_url,
         ai_model=payload.ai_model,
+        ai_key=payload.ai_key,
     )
     input_data = {"context": context, "query": query} if has_real_context else {"query": query}
 
     async def token_generator():
-        async for chunk in chain.astream(input_data):
-            yield chunk
+        try:
+            async for chunk in chain.astream(input_data):
+                yield chunk
+        except Exception as e:
+            print(f"[ERROR] Streaming LLM gagal: {e}")
+            yield f"\n[Error: {e}]"
 
     return StreamingResponse(token_generator(), media_type="text/plain")
 

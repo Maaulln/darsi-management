@@ -62,6 +62,8 @@ services:
         condition: service_started
       ollama:
         condition: service_started
+      mcp-server:
+        condition: service_healthy
     ports:
       - "8000:8000"
 
@@ -86,6 +88,12 @@ services:
         condition: service_started
     ports:
       - "8100:8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   simrs-simulator:
     image: python:3.11-slim
@@ -173,10 +181,18 @@ services:
         condition: service_healthy
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: node:20-alpine
     container_name: darsi-frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_METABASE_URL=http://localhost:3001
+    command: sh -c "npm install && npm run dev"
     depends_on:
       - backend
     restart: unless-stopped

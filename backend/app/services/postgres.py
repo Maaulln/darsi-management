@@ -14,7 +14,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 
 
 def init_settings_db() -> None:
-    """Inisialisasi tabel darsi_settings dan darsi_incoming_apis jika belum ada."""
+    """Inisialisasi tabel darsi_settings, darsi_incoming_apis, dan darsi_ai_models jika belum ada."""
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS darsi_settings (
@@ -38,6 +38,23 @@ def init_settings_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS darsi_ai_models (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL UNIQUE,
+                api_url TEXT NOT NULL,
+                api_key TEXT,
+                model_name VARCHAR(100) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        # Tambah kolom api_key jika belum ada
+        try:
+            conn.execute(text("ALTER TABLE darsi_ai_models ADD COLUMN api_key TEXT;"))
+        except Exception:
+            pass
         conn.execute(text("""
             INSERT INTO darsi_settings (key, value)
             VALUES ('simulator_enabled', 'true')

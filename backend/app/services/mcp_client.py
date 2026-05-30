@@ -9,20 +9,18 @@ import httpx
 from app.core.config import settings
 
 
-def _get_db_ai_config() -> tuple[str, str]:
+def _get_db_ai_config() -> tuple[str, str, str]:
     try:
         from sqlalchemy import text
         from app.services.postgres import engine
         with engine.connect() as conn:
-            url = conn.execute(
-                text("SELECT value FROM darsi_settings WHERE key = 'ai_url'")
-            ).scalar()
-            model = conn.execute(
-                text("SELECT value FROM darsi_settings WHERE key = 'ai_model'")
-            ).scalar()
-            return url or "", model or ""
+            rows = conn.execute(
+                text("SELECT key, value FROM darsi_settings WHERE key IN ('ai_url', 'ai_model', 'ai_key')")
+            ).fetchall()
+            cfg = {r[0]: r[1] for r in rows}
+            return cfg.get("ai_url", ""), cfg.get("ai_model", ""), cfg.get("ai_key", "")
     except Exception:
-        return "", ""
+        return "", "", ""
 
 
 class MCPClient:
@@ -115,14 +113,15 @@ class MCPClient:
         n_results: int = 5,
         use_rag: bool = True,
     ) -> dict[str, Any]:
-        """RAG retrieval + LLM generation via MCP server (LangChain + Ollama)."""
-        url, model = _get_db_ai_config()
+        """RAG retrieval + LLM generation via MCP server (LangChain + Ollama/Gemini)."""
+        url, model, key = _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
             "use_rag": use_rag,
-            "ai_url": url,
-            "ai_model": model,
+            "ai_url": url or None,
+            "ai_model": model or None,
+            "ai_key": key or None,
         }
         try:
             resp = httpx.post(
@@ -150,13 +149,14 @@ class MCPClient:
         use_rag: bool = True,
     ):
         """RAG + LLM streaming via MCP server — yield token chunks secara async."""
-        url, model = _get_db_ai_config()
+        url, model, key = _get_db_ai_config()
         payload: dict[str, Any] = {
             "query": query,
             "n_results": n_results,
             "use_rag": use_rag,
-            "ai_url": url,
-            "ai_model": model,
+            "ai_url": url or None,
+            "ai_model": model or None,
+            "ai_key": key or None,
         }
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(

@@ -8,12 +8,35 @@ const SUGGESTIONS = [
   'Rangkum biaya operasional secara keseluruhan',
 ];
 
+const STORAGE_KEY = 'darsi_chat_messages';
+
+function loadMessages() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveMessages(msgs) {
+  try {
+    const toSave = msgs
+      .filter(m => !m.streaming)
+      .map(({ role, content, isError }) => ({ role, content, isError }));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+  } catch {}
+}
+
 export default function Chat() {
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState(loadMessages);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [useRag, setUseRag] = useState(true);
   const [activeModel, setActiveModel] = useState('Memuat...');
+  const [availableModels, setAvailableModels] = useState([]);
+  const [selectedModelId, setSelectedModelId] = useState(null);
+  const [showModelSelector, setShowModelSelector] = useState(false);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -22,13 +45,30 @@ export default function Chat() {
   }, [messages]);
 
   useEffect(() => {
-    fetch('/api/settings/ai')
+    saveMessages(messages);
+  }, [messages]);
+
+  useEffect(() => {
+    // Fetch available models and get active one
+    fetch('/api/settings/ai-models')
       .then(r => r.json())
       .then(data => {
-        setActiveModel(data.model || 'qwen3.5:2b (Lokal)');
+        if (data.models && data.models.length > 0) {
+          setAvailableModels(data.models);
+          const activeModel = data.models.find(m => m.is_active);
+          if (activeModel) {
+            setSelectedModelId(activeModel.id);
+            setActiveModel(activeModel.name);
+          } else {
+            // Jika tidak ada model aktif, tampilkan yang pertama
+            setActiveModel(data.models[0].name);
+          }
+        } else {
+          setActiveModel('Default (Ollama Lokal)');
+        }
       })
       .catch(() => {
-        setActiveModel('qwen3.5:2b (Lokal)');
+        setActiveModel('Default (Ollama Lokal)');
       });
   }, []);
 
@@ -94,6 +134,20 @@ export default function Chat() {
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   };
 
+  const handleSelectModel = (model) => {
+    // Activate the selected model
+    fetch(`/api/settings/ai-models/${model.id}/activate`, { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'ok') {
+          setSelectedModelId(model.id);
+          setActiveModel(model.name);
+          setShowModelSelector(false);
+        }
+      })
+      .catch(err => console.error('Gagal mengaktifkan model:', err));
+  };
+
   return (
     <div className="chat-layout">
       {/* Toolbar */}
@@ -108,14 +162,86 @@ export default function Chat() {
           />
           RAG (konteks data operasional)
         </label>
-        <span style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--muted)', background: '#f1f5f9', padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--border)' }}>
-          Model: <strong>{activeModel}</strong>
-        </span>
+        
+        {/* Model Selector */}
+        <div style={{ position: 'relative', marginLeft: '12px' }}>
+          <button
+            onClick={() => setShowModelSelector(!showModelSelector)}
+            style={{
+              fontSize: '12px',
+              color: '#475569',
+              background: '#f1f5f9',
+              padding: '4px 8px',
+              borderRadius: '4px',
+              border: '1px solid var(--border)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontWeight: '500'
+            }}
+          >
+            📦 <strong>{activeModel}</strong>
+            <span style={{ fontSize: '10px' }}>▼</span>
+          </button>
+          
+          {showModelSelector && availableModels.length > 0 && (
+            <div style={{
+              position: 'absolute',
+              top: '100%',
+              left: 0,
+              marginTop: '4px',
+              background: '#fff',
+              border: '1px solid var(--border)',
+              borderRadius: '6px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+              minWidth: '200px',
+              zIndex: 1000
+            }}>
+              {availableModels.map(model => (
+                <button
+                  key={model.id}
+                  onClick={() => handleSelectModel(model)}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    textAlign: 'left',
+                    padding: '10px 12px',
+                    border: 'none',
+                    background: model.is_active ? '#ecfdf5' : '#fff',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    borderBottom: model.id !== availableModels[availableModels.length - 1].id ? '1px solid #f1f5f9' : 'none',
+                    color: 'var(--text)',
+                    transition: 'background 0.2s'
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!model.is_active) e.target.style.background = '#f1f5f9';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.target.style.background = model.is_active ? '#ecfdf5' : '#fff';
+                  }}
+                >
+                  <div style={{ fontWeight: model.is_active ? '600' : '500' }}>
+                    {model.is_active && '✓ '} {model.name}
+                  </div>
+                  <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '2px', fontFamily: 'monospace' }}>
+                    {model.model_name}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
         <span style={{ flex: 1 }} />
         {messages.length > 0 && (
           <button
             className="btn"
-            onClick={() => setMessages([])}
+            onClick={() => {
+              setMessages([]);
+              try { sessionStorage.removeItem(STORAGE_KEY); } catch {}
+            }}
             style={{ fontSize: '11px', padding: '4px 10px' }}
           >
             Hapus riwayat
@@ -160,8 +286,8 @@ export default function Chat() {
           ))
         )}
 
-        {/* Typing indicator */}
-        {sending && (
+        {/* Typing indicator — hanya tampil sebelum token pertama datang */}
+        {sending && !messages.some(m => m.streaming) && (
           <div className="msg ai">
             <div className="msg-bubble typing-bubble">
               <div className="typing-dot" />
